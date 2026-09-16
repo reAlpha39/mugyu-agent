@@ -11,6 +11,34 @@ the brief" below — the top-level field is `event`, not `type`).
 The recorded fixture is `tests/fixtures/agy_stream_sample.ndjson`, captured
 exactly per Step 2 of the task-1 brief.
 
+## Fixtures — which one covers which case (ACTION ITEM)
+
+Two fixtures are committed under `tests/fixtures/`, and they are **not
+interchangeable**:
+
+- **`agy_stream_sample.ndjson`** (10 lines, the canonical Step-2 capture) —
+  covers tool-call start/finish lifecycle (2 tool invocations, `ACTIVE` then
+  `DONE`) and the **single-chunk** text case: its one text-bearing
+  `agent_response` step emits its entire text in a single `DONE` event, no
+  preceding `ACTIVE` deltas.
+- **`agy_stream_multichunk.ndjson`** (11 lines, supplementary probe) —
+  covers the **multi-chunk delta** case: `step_index 3` carries 5 separate
+  `step_update` lines with non-overlapping `text_delta` values
+  (`'Starting the check now. The single w'`, `'ord contained in [probe.'`,
+  `'txt](file://'`, `'/tmp/agy-probe/'`, `'probe.txt) is hello.\n'`) that only
+  reconstruct the real sentence when concatenated in order. This is the
+  fixture that actually falsifies "cumulative snapshot" — `agy_stream_sample.ndjson`
+  alone cannot, since it never repeats a single step's text across multiple
+  events.
+
+**Action item: any adapter change that touches assistant-text handling
+(append-vs-replace, per-`step_index` buffering) must be tested against
+`agy_stream_multichunk.ndjson`, not just `agy_stream_sample.ndjson`.** A test
+suite that only replays `agy_stream_sample.ndjson` cannot catch a regression
+from "append" to "replace" for text_delta, because that fixture never
+contains two `text_delta` events for the same `step_index` to distinguish
+the two behaviors. Task 6/7/9 test authors: replay both fixtures.
+
 ## Prompt argument form
 
 Both forms work:
@@ -101,7 +129,10 @@ determined empirically, not assumed, by re-running the probe with a prompt
 forced to produce narration both before and after a tool call
 (`"Say the sentence 'Starting the check now.' verbatim first. Then read
 probe.txt and, in a new sentence, tell me the single word it contains."`)
-and diffing consecutive `text_delta` values for the same `step_index`:
+and diffing consecutive `text_delta` values for the same `step_index`. That
+probe's capture is committed verbatim as `tests/fixtures/agy_stream_multichunk.ndjson`
+(see "Fixtures — which one covers which case" above) so this conclusion is
+testable, not just narrated:
 
 ```
 step_index=3 state=ACTIVE text_delta='Starting the check now. The single w'
