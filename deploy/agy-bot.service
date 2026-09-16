@@ -1,0 +1,26 @@
+[Unit]
+Description=Discord bridge to the Antigravity CLI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agy
+Group=agy
+WorkingDirectory=/srv/agy
+Environment=AGY_CONFIG=/srv/agy/config.toml
+Environment=AGY_DB=/srv/agy/state.db
+EnvironmentFile=/etc/agy-bot.env
+ExecStart=/srv/agy/venv/bin/python -m agybot.bot
+Restart=always
+RestartSec=5
+
+# The service account is the real containment boundary for the owner tier.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/srv/agy
+
+[Install]
+WantedBy=multi-user.target
