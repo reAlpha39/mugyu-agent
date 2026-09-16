@@ -2857,7 +2857,7 @@ from agybot.runner import (
 - [ ] **Step 5: Run the whole suite**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 145 passed
+Expected: 143 passed
 
 - [ ] **Step 6: Commit**
 
@@ -2998,7 +2998,7 @@ python3 -m venv .venv
 - [ ] **Step 3: Run the full suite one last time**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 145 passed
+Expected: 143 passed
 
 - [ ] **Step 4: Commit**
 
