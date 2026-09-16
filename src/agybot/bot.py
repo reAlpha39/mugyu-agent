@@ -189,17 +189,22 @@ class AgyBot(discord.Client):
 
                 await turn.run()
             finally:
-                # Persisted here, not after turn.run(), so a turn that raises
-                # still records the conversation agy already created —
-                # otherwise the next message starts a second conversation and
-                # the first is leaked.
-                if sink.conversation_id and not row.conversation_id:
-                    self.store.set_conversation(str(thread.id),
-                                                sink.conversation_id)
-                self.store.touch(str(thread.id))
-                self.slots.release()
-                self.turns.pop(thread.id, None)
-                self.owners.pop(thread.id, None)
+                try:
+                    # Persist even when the turn failed: agy created the
+                    # conversation regardless, and losing the id orphans it.
+                    if sink.conversation_id and not row.conversation_id:
+                        self.store.set_conversation(str(thread.id),
+                                                    sink.conversation_id)
+                    self.store.touch(str(thread.id))
+                except Exception:
+                    # A sqlite failure must never cost the slot — leaking one
+                    # permanently reduces capacity with no way to recover.
+                    log.exception("failed to persist state for thread %s",
+                                  thread.id)
+                finally:
+                    self.slots.release()
+                    self.turns.pop(thread.id, None)
+                    self.owners.pop(thread.id, None)
 
     async def _cancel(self, thread: discord.Thread, user_id: str) -> None:
         turn = self.turns.get(thread.id)
