@@ -1153,6 +1153,97 @@ async def test_finish_without_any_output_still_reports(ch):
     await s.start()
     await s.finish(1, stderr_tail="not authenticated")
     assert "not authenticated" in ch.messages[-1]
+
+
+class SuspendingChannel:
+    """A channel whose send and edit genuinely yield to the event loop.
+
+    FakeChannel's coroutines contain no suspension point, so awaiting them
+    never returns control to the loop and the pump task is never scheduled.
+    Concurrency can only be observed through a channel that really suspends.
+    """
+
+    def __init__(self):
+        self.messages: list[str] = []
+
+    async def send(self, content: str) -> int:
+        await asyncio.sleep(0)
+        self.messages.append(content)
+        return len(self.messages) - 1
+
+    async def edit(self, handle: int, content: str) -> None:
+        await asyncio.sleep(0)
+        self.messages[handle] = content
+
+
+def racing_sink(ch) -> Sink:
+    # interval=0 is deliberate here: maximum pump pressure, to force the
+    # interleavings a realistic interval would only hit occasionally.
+    return Sink(ch.send, ch.edit, interval=0)
+
+
+async def test_the_pump_actually_runs():
+    ch = SuspendingChannel()
+    s = racing_sink(ch)
+    await s.start()
+    await s.feed(Text("partial"))
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert ch.messages[0] == "partial", "the pump never wrote anything"
+    await s.finish(0)
+
+
+async def test_pump_cannot_overwrite_a_sealed_message():
+    ch = SuspendingChannel()
+    s = racing_sink(ch)
+    await s.start()
+    await s.feed(Text("a" * (LIMIT - 5)))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    await s.feed(Text("bbbbbbbbbb"))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    await s.finish(0)
+    assert ch.messages[0] == "a" * (LIMIT - 5)
+    assert "bbbbbbbbbb" not in ch.messages[0]
+    assert "bbbbbbbbbb" in ch.messages[1]
+
+
+async def test_finish_is_not_clobbered_by_an_in_flight_pump_edit():
+    ch = SuspendingChannel()
+    s = racing_sink(ch)
+    await s.start()
+    await s.feed(Text("body"))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    await s.finish(0)
+    assert "-# ✅" in ch.messages[-1]
+    assert ch.messages[-1].startswith("body")
+
+
+async def test_no_text_is_lost_or_duplicated_across_many_seals():
+    ch = SuspendingChannel()
+    s = racing_sink(ch)
+    await s.start()
+    for i in range(60):
+        await s.feed(Text(f"[{i:03d}]" + "x" * 60))
+        await asyncio.sleep(0)
+    await s.finish(0)
+    joined = "".join(ch.messages)
+    for i in range(60):
+        assert joined.count(f"[{i:03d}]") == 1, f"marker {i} lost or duplicated"
+
+
+async def test_every_message_stays_within_discords_hard_cap():
+    ch = SuspendingChannel()
+    s = racing_sink(ch)
+    await s.start()
+    for _ in range(40):
+        await s.feed(Text("y" * 120))
+        await asyncio.sleep(0)
+    await s.finish(1, stderr_tail="e" * 500)
+    assert all(len(m) <= 2000 for m in ch.messages), \
+        [len(m) for m in ch.messages if len(m) > 2000]
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1164,8 +1255,11 @@ Expected: `ImportError: cannot import name 'Sink' from 'agybot.render'`
 
 Append to `src/agybot/render.py`:
 
+Hoist the new imports into the module's existing import block rather than leaving them here.
+
 ```python
 import asyncio
+import contextlib
 import time
 from typing import Any, Awaitable, Callable
 
@@ -1199,6 +1293,7 @@ class Sink:
         self._handle: Any = None
         self._dirty = False
         self._writer: asyncio.Task | None = None
+        self._lock = asyncio.Lock()
         self._started = 0.0
         self._tools = 0
         self.conversation_id: str | None = None
@@ -1220,28 +1315,39 @@ class Sink:
         else:
             text = piece.s
 
-        for sealed in self._chunker.feed(text):
-            await self._edit(self._handle, sealed)
-            self._handle = await self._send(self._chunker.current or "…")
-        self._dirty = True
+        # The chunker advance and the handle repoint must be atomic with
+        # respect to the pump, which reads both. Splitting them lets the pump
+        # write the next body onto the previous, already-sealed message.
+        async with self._lock:
+            for sealed in self._chunker.feed(text):
+                await self._edit(self._handle, sealed)
+                self._handle = await self._send(self._chunker.current or "…")
+            self._dirty = True
 
     async def finish(self, returncode: int, stderr_tail: str = "",
                      cancelled: bool = False) -> None:
-        if self._writer is not None:
-            self._writer.cancel()
-            self._writer = None
+        writer, self._writer = self._writer, None
+        if writer is not None:
+            writer.cancel()
+            # Awaiting the cancelled task guarantees no pump edit is still in
+            # flight; otherwise one can land after the footer and clobber it.
+            # This await is outside the lock, because the writer may itself be
+            # waiting to acquire it.
+            with contextlib.suppress(asyncio.CancelledError):
+                await writer
 
-        footer = self._footer(returncode, stderr_tail, cancelled)
-        bodies = self._chunker.flush()
-        body = bodies[0] if bodies else ""
+        async with self._lock:
+            footer = self._footer(returncode, stderr_tail, cancelled)
+            bodies = self._chunker.flush()
+            body = bodies[0] if bodies else ""
 
-        # flush() yields at most one body, so the footer joins it whenever
-        # the pair fits inside Discord's hard 2000-character message cap.
-        if len(body) + len(footer) <= 2000:
-            await self._edit(self._handle, (body + footer) or PLACEHOLDER)
-        else:
-            await self._edit(self._handle, body)
-            self._handle = await self._send(footer)
+            # flush() yields at most one body, so the footer joins it whenever
+            # the pair fits inside Discord's hard 2000-character message cap.
+            if len(body) + len(footer) <= 2000:
+                await self._edit(self._handle, (body + footer) or PLACEHOLDER)
+            else:
+                await self._edit(self._handle, body)
+                self._handle = await self._send(footer)
 
     def _footer(self, returncode: int, stderr_tail: str,
                 cancelled: bool) -> str:
@@ -1262,10 +1368,11 @@ class Sink:
         try:
             while True:
                 await asyncio.sleep(self._interval)
-                if self._dirty:
-                    self._dirty = False
-                    await self._edit(self._handle,
-                                     self._chunker.current or PLACEHOLDER)
+                async with self._lock:
+                    if self._dirty:
+                        self._dirty = False
+                        await self._edit(self._handle,
+                                         self._chunker.current or PLACEHOLDER)
         except asyncio.CancelledError:
             pass
 ```
@@ -1275,7 +1382,7 @@ Note the `finish` path. `Chunker.flush()` returns at most one body, so the foote
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/test_render.py -v`
-Expected: 38 passed
+Expected: 43 passed
 
 - [ ] **Step 5: Commit**
 
@@ -2679,7 +2786,7 @@ from agybot.runner import (
 - [ ] **Step 5: Run the whole suite**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 128 passed
+Expected: 133 passed
 
 - [ ] **Step 6: Commit**
 
@@ -2820,7 +2927,7 @@ python3 -m venv .venv
 - [ ] **Step 3: Run the full suite one last time**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 128 passed
+Expected: 133 passed
 
 - [ ] **Step 4: Commit**
 
