@@ -27,6 +27,13 @@ MENTION_RE = re.compile(r"<@!?(\d+)>")
 WORKSPACE_RE = re.compile(r"^\[([A-Za-z0-9._-]+)\]\s*")
 THREAD_NAME_MAX = 60
 STOP_COMMAND = "!stop"
+# Progress marks on the message that triggered a turn: 👀 the moment it is
+# picked up, swapped for the outcome when the turn ends. ❌ is deliberately
+# not used for failure — it is the cancel gesture, and seeing it appear on
+# your own message would read as an instruction rather than a result.
+READ_EMOJI = "👀"
+DONE_EMOJI = "✅"
+FAIL_EMOJI = "⚠️"
 RESET_COMMAND = "!reset"
 CANCEL_EMOJI = "❌"
 
@@ -148,7 +155,8 @@ class AgyBot(discord.Client):
         thread = await message.create_thread(name=thread_name(parsed.prompt))
         self.store.create_thread(str(thread.id), workspace,
                                  str(message.author.id))
-        await self._run(thread, parsed.prompt, tier, str(message.author.id))
+        await self._run(thread, parsed.prompt, tier, str(message.author.id),
+                        message)
 
     async def _on_thread_message(self, message: discord.Message) -> None:
         thread = message.channel
@@ -175,13 +183,28 @@ class AgyBot(discord.Client):
             # No reply: a reply on every image post would be noise.
             return
 
-        await self._run(thread, content, tier, str(message.author.id))
+        await self._run(thread, content, tier, str(message.author.id),
+                        message)
 
-    async def _run(self, thread: discord.Thread, prompt: str,
-                   tier: str, author_id: str) -> None:
+    async def _mark(self, message: discord.Message, emoji: str) -> None:
+        """Replace the read mark with an outcome. Never raises."""
+        with contextlib.suppress(Exception):
+            await message.remove_reaction(READ_EMOJI, self.user)
+        with contextlib.suppress(Exception):
+            await message.add_reaction(emoji)
+
+    async def _run(self, thread: discord.Thread, prompt: str, tier: str,
+                   author_id: str, message: discord.Message) -> None:
+        # Marked before the per-thread lock, so a follow-up posted while an
+        # earlier turn is still running is visibly acknowledged rather than
+        # sitting unanswered until that turn finishes.
+        with contextlib.suppress(Exception):
+            await message.add_reaction(READ_EMOJI)
+
         async with self.lock_for(thread.id):
             row = self.store.get_thread(str(thread.id))
             if row is None:
+                await self._mark(message, FAIL_EMOJI)
                 return
 
             async def send(content: str):
@@ -215,6 +238,7 @@ class AgyBot(discord.Client):
             except BaseException:
                 self.turns.pop(thread.id, None)
                 self.owners.pop(thread.id, None)
+                await self._mark(message, FAIL_EMOJI)
                 raise
 
             try:
@@ -225,13 +249,23 @@ class AgyBot(discord.Client):
 
                 if turn.cancelled:
                     await thread.send("🛑 Cancelled before it started.")
+                    await self._mark(message, FAIL_EMOJI)
                     return
 
                 # Discord's own typing indicator, refreshed by discord.py for
                 # as long as the turn runs. Editing the live message does not
                 # clear it, so it persists across the whole turn.
-                async with thread.typing():
-                    await turn.run()
+                outcome = FAIL_EMOJI
+                try:
+                    async with thread.typing():
+                        returncode = await turn.run()
+                    if returncode == 0 and not turn.cancelled:
+                        outcome = DONE_EMOJI
+                finally:
+                    # Cancelled and failed turns share ⚠️: both mean "this did
+                    # not produce what you asked for", and the footer says
+                    # which.
+                    await self._mark(message, outcome)
             finally:
                 try:
                     # Persist even when the turn failed: agy created the
