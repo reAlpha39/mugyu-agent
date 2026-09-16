@@ -31,6 +31,11 @@ STOP_COMMAND = "!stop"
 # picked up, swapped for the outcome when the turn ends. ❌ is deliberately
 # not used for failure — it is the cancel gesture, and seeing it appear on
 # your own message would read as an instruction rather than a result.
+# Where a conversation lives. A guild thread opened per task, or the owner's
+# DM channel, which has no threads and is itself the conversation. Both carry
+# the id, send() and typing() that _run needs.
+Conversation = discord.Thread | discord.DMChannel
+
 READ_EMOJI = "👀"
 DONE_EMOJI = "✅"
 FAIL_EMOJI = "⚠️"
@@ -63,7 +68,7 @@ class AgyBot(discord.Client):
     def __init__(self, cfg: Config, store: Store) -> None:
         super().__init__(intents=discord.Intents(
             guilds=True, guild_messages=True, message_content=True,
-            guild_reactions=True,
+            guild_reactions=True, dm_messages=True, dm_reactions=True,
         ))
         self.cfg = cfg
         self.store = store
@@ -115,6 +120,10 @@ class AgyBot(discord.Client):
         if message.author.bot or self.user is None:
             return
 
+        if isinstance(message.channel, discord.DMChannel):
+            await self._on_direct_message(message)
+            return
+
         if isinstance(message.channel, discord.Thread):
             await self._on_thread_message(message)
             return
@@ -123,6 +132,56 @@ class AgyBot(discord.Client):
             log.info("mentioned by %s in channel %s",
                      message.author.id, message.channel.id)
             await self._on_new_task(message)
+
+    async def _on_direct_message(self, message: discord.Message) -> None:
+        """Owner-only private channel, with the DM itself as the conversation.
+
+        A DM has no threads, so there is nothing to open per task. The channel
+        is the conversation instead: every message continues it, and !reset
+        starts a fresh one. No mention is needed — in a private channel with
+        one bot, addressing it is unambiguous.
+        """
+        author_id = str(message.author.id)
+        if tier_of(self.cfg, author_id) != "owner":
+            # Silently ignored rather than refused. A stranger DMing the bot
+            # learns nothing about whether it exists or who may use it.
+            log.info("ignoring DM from %s: not the owner", author_id)
+            return
+
+        content = message.content.strip()
+        if not content:
+            return
+
+        row = self.store.get_thread(str(message.channel.id))
+
+        if content == STOP_COMMAND:
+            await self._cancel(message.channel, author_id)
+            return
+        if content == RESET_COMMAND:
+            if row is None:
+                await message.channel.send("Nothing to reset yet.")
+                return
+            await self._reset(message.channel, row, author_id)
+            return
+
+        if row is None:
+            parsed = parse_mention(content, str(self.user.id))
+            if not parsed.prompt:
+                return
+            try:
+                workspace = resolve_workspace(self.cfg, parsed.workspace)
+            except UnknownWorkspace as exc:
+                await message.channel.send(
+                    f"Unknown workspace `{exc.name}`. "
+                    f"Allowed: {', '.join(f'`{a}`' for a in exc.allowed)}"
+                )
+                return
+            self.store.create_thread(str(message.channel.id), workspace,
+                                     author_id)
+            content = parsed.prompt
+
+        log.info("accepted owner DM turn: prompt=%r", content[:80])
+        await self._run(message.channel, content, "owner", author_id, message)
 
     async def _on_new_task(self, message: discord.Message) -> None:
         if str(message.channel.id) not in self.cfg.channels:
@@ -193,7 +252,7 @@ class AgyBot(discord.Client):
         with contextlib.suppress(Exception):
             await message.add_reaction(emoji)
 
-    async def _run(self, thread: discord.Thread, prompt: str, tier: str,
+    async def _run(self, thread: Conversation, prompt: str, tier: str,
                    author_id: str, message: discord.Message) -> None:
         # Marked before the per-thread lock, so a follow-up posted while an
         # earlier turn is still running is visibly acknowledged rather than
@@ -284,7 +343,7 @@ class AgyBot(discord.Client):
                     self.turns.pop(thread.id, None)
                     self.owners.pop(thread.id, None)
 
-    async def _cancel(self, thread: discord.Thread, user_id: str) -> None:
+    async def _cancel(self, thread: Conversation, user_id: str) -> None:
         turn = self.turns.get(thread.id)
         if turn is None:
             return
@@ -294,7 +353,7 @@ class AgyBot(discord.Client):
             return
         await turn.cancel()
 
-    async def _reset(self, thread: discord.Thread, row,
+    async def _reset(self, thread: Conversation, row,
                      user_id: str) -> None:
         """Forget this thread's agy conversation without closing the thread.
 
@@ -314,7 +373,7 @@ class AgyBot(discord.Client):
                 self.user.id if self.user else None):
             return
         channel = self.get_channel(payload.channel_id)
-        if isinstance(channel, discord.Thread):
+        if isinstance(channel, (discord.Thread, discord.DMChannel)):
             await self._cancel(channel, str(payload.user_id))
 
 

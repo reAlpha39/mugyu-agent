@@ -38,6 +38,21 @@ The `[bliss-app]` prefix selects a workspace by name. Omit it to use the
 default. Only names listed in `config.toml` are accepted; a filesystem path
 in a message is not a location, just an unknown name.
 
+## Direct messages
+
+The owner can DM the bot instead of using a channel. No mention is needed —
+in a private channel with one bot, addressing it is unambiguous.
+
+A DM has no threads, so the DM channel *is* the conversation: every message
+continues it, and `!reset` starts a fresh one. `!stop` and the ❌ reaction
+cancel a running turn there as they do in a thread. The workspace is chosen
+on the first message (with a `[name]` prefix, or the default) and then stays
+put for that DM.
+
+Anyone who is not the owner is ignored silently rather than refused, so a
+stranger DMing the bot learns nothing about whether it exists or who may
+use it. Members get no DM access at all, only channel threads.
+
 ## Access tiers
 
 | Tier | Flags | Can |
