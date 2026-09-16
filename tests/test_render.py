@@ -230,20 +230,27 @@ async def test_text_replaces_the_placeholder(ch):
     assert ch.messages[0].startswith("hello world")
 
 
-async def test_tool_renders_as_subtext(ch):
+async def test_tool_activity_is_not_rendered(ch):
     s = sink_for(ch)
     await s.start()
     await s.feed(Tool("read", "auth.py", ok=None))
+    await s.feed(Text("the answer"))
     await s.finish(0)
-    assert "-# 🔧 read · auth.py" in ch.messages[0]
+    whole = "\n".join(ch.messages)
+    assert "read" not in whole
+    assert "auth.py" not in whole
+    assert "the answer" in whole
 
 
-async def test_failed_tool_renders_a_warning(ch):
+async def test_a_failed_tool_is_not_rendered_either(ch):
     s = sink_for(ch)
     await s.start()
     await s.feed(Tool("bash", "exit 1", ok=False))
+    await s.feed(Text("done"))
     await s.finish(0)
-    assert "-# ⚠️ bash · exit 1" in ch.messages[0]
+    whole = "\n".join(ch.messages)
+    assert "bash" not in whole
+    assert "⚠️" not in whole
 
 
 async def test_meta_is_captured_and_not_displayed(ch):

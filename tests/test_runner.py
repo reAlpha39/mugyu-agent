@@ -398,7 +398,7 @@ async def test_successful_turn_renders_text_and_tools(tmp_path):
     await t.run()
     whole = "\n".join(ch.messages)
     assert "the word is banana" in whole
-    assert "🔧 view_file · probe.txt" in whole
+    assert "view_file" not in whole, "tool activity must not be rendered"
     assert "-# ✅" in whole
 
 

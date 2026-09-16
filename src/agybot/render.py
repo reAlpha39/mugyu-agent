@@ -195,11 +195,13 @@ class Sink:
             return
 
         if isinstance(piece, Tool):
+            # Counted for the footer but not rendered: the per-call subtext
+            # lines were noise in the channel. The footer's tool count still
+            # shows that work happened.
             self._tools += 1
-            icon = "⚠️" if piece.ok is False else "🔧"
-            text = f"\n-# {icon} {piece.name} · {piece.detail}\n"
-        else:
-            text = piece.s
+            return
+
+        text = piece.s
 
         # The chunker advance and the handle repoint must be atomic with
         # respect to the pump, which reads both. Splitting them lets the pump

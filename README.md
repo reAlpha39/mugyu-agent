@@ -84,14 +84,16 @@ under `/srv/agy` avoids the problem, and is the layout the unit assumes.
 
 ## Known limitations
 
-**Tool failures are not flagged in the output.** The schema probe that
-pinned `agy`'s stream-json event shape never captured a failing tool call,
-so the adapter deliberately renders nothing for any tool state other than
-`ACTIVE`/`DONE` rather than guessing that an unknown state means failure. A
-failing tool call therefore shows as an ordinary `-# 🔧` line, the same as a
-successful one; the agent's own text and the turn's exit code are what
-report trouble. See `docs/agy-stream-schema.md` for the observed schema and
-the open question on failure signalling.
+**Tool activity is not shown.** Tool calls are counted, not displayed: the
+footer reports how many ran, but no individual call produces a line in the
+channel. A failing tool is therefore invisible as well — the agent's own
+text and the turn's exit code are what report trouble.
+
+Separately, the schema probe that pinned `agy`'s stream-json event shape
+never captured a failing tool call, so the adapter deliberately treats any
+tool state other than `ACTIVE`/`DONE` as unhandled rather than guessing that
+an unknown state means failure. See `docs/agy-stream-schema.md` for the
+observed schema and the open question on failure signalling.
 
 ## Setup
 

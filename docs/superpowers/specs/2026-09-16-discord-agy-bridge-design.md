@@ -164,7 +164,7 @@ Because the child runs in its own session, it outlives the bot. The bot is the o
 | Piece | Source | Rendering |
 |---|---|---|
 | `Text(str)` | `step_update` with `step_type: "agent_response"`, from `text_delta` | Appended to the message buffer |
-| `Tool(name, detail, ok)` | `step_update` with `step_type: "tool"`, from `tool_name` and `tool_info.parameters` | A subtext line, e.g. `-# 🔧 view_file · auth.py` |
+| `Tool(name, detail, ok)` | `step_update` with `step_type: "tool"`, from `tool_name` and `tool_info.parameters` | Counted for the footer only; not rendered in the channel |
 | `Meta(conversation_id)` | `init` event, from top-level `conversation_id` | Written to sqlite, never displayed |
 
 Assistant text arrives as incremental deltas, not cumulative snapshots, and a
