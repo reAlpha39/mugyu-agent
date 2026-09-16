@@ -1,4 +1,10 @@
-from agybot.runner import build_argv, minimal_env
+import json
+from pathlib import Path
+
+import pytest
+
+from agybot.runner import EventAdapter, build_argv, minimal_env
+from agybot.render import Meta, Text, Tool
 
 
 def argv(**kw):
@@ -99,3 +105,128 @@ def test_minimal_env_keeps_agy_config_location():
 
 def test_minimal_env_omits_absent_keys():
     assert minimal_env({}) == {}
+
+
+FIXTURES = Path(__file__).parent / "fixtures"
+FIXTURE = FIXTURES / "agy_stream_sample.ndjson"
+MULTICHUNK = FIXTURES / "agy_stream_multichunk.ndjson"
+
+
+def replay(path: Path) -> list:
+    a = EventAdapter()
+    pieces = []
+    for line in path.read_text().splitlines():
+        if line.strip():
+            pieces += a.feed(json.loads(line))
+    return pieces
+
+
+def init_ev(cid: str = "c-1") -> dict:
+    return {"event": "init", "conversation_id": cid,
+            "init": {"cwd": "/tmp", "tools": []}}
+
+
+def step(**kw) -> dict:
+    return {"event": "step_update", "step_update": kw}
+
+
+def test_init_event_yields_the_conversation_id():
+    assert EventAdapter().feed(init_ev()) == [Meta("c-1")]
+
+
+def test_conversation_id_is_emitted_only_once():
+    a = EventAdapter()
+    a.feed(init_ev())
+    assert a.feed(init_ev()) == []
+
+
+def test_result_event_yields_nothing():
+    ev = {"event": "result", "result": {"status": "SUCCESS"}}
+    assert EventAdapter().feed(ev) == []
+
+
+def test_user_input_step_yields_nothing():
+    assert EventAdapter().feed(
+        step(step_index=0, state="DONE", step_type="user_input")) == []
+
+
+def test_agent_response_delta_yields_text():
+    assert EventAdapter().feed(
+        step(step_type="agent_response", state="ACTIVE",
+             text_delta="hello")) == [Text("hello")]
+
+
+def test_agent_response_without_text_delta_yields_nothing():
+    assert EventAdapter().feed(
+        step(step_type="agent_response", state="ACTIVE")) == []
+
+
+def test_consecutive_deltas_are_emitted_in_arrival_order():
+    a = EventAdapter()
+    out = (a.feed(step(step_type="agent_response", state="ACTIVE",
+                       text_delta="Star"))
+           + a.feed(step(step_type="agent_response", state="DONE",
+                         text_delta="ted.")))
+    assert out == [Text("Star"), Text("ted.")]
+
+
+def test_tool_start_yields_a_pending_tool_piece():
+    ev = step(step_type="tool", state="ACTIVE", tool_name="view_file",
+              tool_info={"name": "view_file",
+                         "parameters": {"AbsolutePath": "/tmp/probe.txt"}})
+    assert EventAdapter().feed(ev) == [Tool("view_file", "/tmp/probe.txt",
+                                            None)]
+
+
+def test_tool_done_is_not_rendered_twice():
+    ev = step(step_type="tool", state="DONE", tool_name="view_file",
+              tool_info={"parameters": {"AbsolutePath": "/tmp/probe.txt"},
+                         "output": "2 lines, 6 bytes"})
+    assert EventAdapter().feed(ev) == []
+
+
+def test_unknown_tool_state_is_surfaced_as_a_failure():
+    ev = step(step_type="tool", state="ERROR", tool_name="run_command",
+              tool_info={"parameters": {"Command": "false"}})
+    assert EventAdapter().feed(ev) == [Tool("run_command", "error", False)]
+
+
+def test_tool_without_recognised_parameters_has_an_empty_detail():
+    ev = step(step_type="tool", state="ACTIVE", tool_name="mystery",
+              tool_info={"parameters": {"Weird": "x"}})
+    assert EventAdapter().feed(ev) == [Tool("mystery", "", None)]
+
+
+def test_unknown_event_yields_nothing():
+    assert EventAdapter().feed({"event": "something_new"}) == []
+
+
+def test_step_update_without_a_payload_yields_nothing():
+    assert EventAdapter().feed({"event": "step_update"}) == []
+
+
+def test_recorded_stream_produces_a_sane_piece_sequence():
+    pieces = replay(FIXTURE)
+
+    metas = [p for p in pieces if isinstance(p, Meta)]
+    assert len(metas) == 1, "exactly one conversation id per turn"
+    assert metas[0].conversation_id, "conversation id must not be empty"
+    assert any(isinstance(p, Text) and p.s.strip() for p in pieces), \
+        "the recorded turn produced no assistant text"
+    tools = [p for p in pieces if isinstance(p, Tool)]
+    assert tools, "the recorded turn was supposed to use a tool"
+    assert all(t.ok is None for t in tools), \
+        "every tool in the recorded turn succeeded, so none should be flagged"
+
+
+def test_multichunk_fixture_reassembles_by_concatenation():
+    """The sample fixture cannot tell append from replace: its one
+    text-bearing step emits everything in a single event. This fixture
+    can — step_index 3 arrives as five disjoint deltas."""
+    texts = [p.s for p in replay(MULTICHUNK) if isinstance(p, Text)]
+    assert len(texts) >= 2, "this fixture must exercise multi-chunk text"
+    joined = "".join(texts)
+    assert "Starting the check now." in joined
+    assert joined.rstrip().endswith("hello.")
+    # A replace-instead-of-append adapter would emit only the last chunk.
+    assert len(joined) > len(texts[-1])
