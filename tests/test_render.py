@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from agybot.render import Chunker, fence_state, LIMIT, Sink, Text, Tool, Meta, fmt_elapsed
@@ -304,3 +306,94 @@ async def test_finish_without_any_output_still_reports(ch):
     await s.start()
     await s.finish(1, stderr_tail="not authenticated")
     assert "not authenticated" in ch.messages[-1]
+
+
+class SuspendingChannel:
+    """A channel whose send and edit genuinely yield to the event loop.
+
+    FakeChannel's coroutines contain no suspension point, so awaiting them
+    never returns control to the loop and the pump task is never scheduled.
+    Concurrency can only be observed through a channel that really suspends.
+    """
+
+    def __init__(self):
+        self.messages: list[str] = []
+
+    async def send(self, content: str) -> int:
+        await asyncio.sleep(0)
+        self.messages.append(content)
+        return len(self.messages) - 1
+
+    async def edit(self, handle: int, content: str) -> None:
+        await asyncio.sleep(0)
+        self.messages[handle] = content
+
+
+def racing_sink(ch) -> Sink:
+    # interval=0 is deliberate here: maximum pump pressure, to force the
+    # interleavings a realistic interval would only hit occasionally.
+    return Sink(ch.send, ch.edit, interval=0)
+
+
+async def test_the_pump_actually_runs():
+    ch = SuspendingChannel()
+    s = racing_sink(ch)
+    await s.start()
+    await s.feed(Text("partial"))
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert ch.messages[0] == "partial", "the pump never wrote anything"
+    await s.finish(0)
+
+
+async def test_pump_cannot_overwrite_a_sealed_message():
+    ch = SuspendingChannel()
+    s = racing_sink(ch)
+    await s.start()
+    await s.feed(Text("a" * (LIMIT - 5)))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    await s.feed(Text("bbbbbbbbbb"))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    await s.finish(0)
+    assert ch.messages[0] == "a" * (LIMIT - 5)
+    assert "bbbbbbbbbb" not in ch.messages[0]
+    assert "bbbbbbbbbb" in ch.messages[1]
+
+
+async def test_finish_is_not_clobbered_by_an_in_flight_pump_edit():
+    ch = SuspendingChannel()
+    s = racing_sink(ch)
+    await s.start()
+    await s.feed(Text("body"))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    await s.finish(0)
+    assert "-# ✅" in ch.messages[-1]
+    assert ch.messages[-1].startswith("body")
+
+
+async def test_no_text_is_lost_or_duplicated_across_many_seals():
+    ch = SuspendingChannel()
+    s = racing_sink(ch)
+    await s.start()
+    for i in range(60):
+        await s.feed(Text(f"[{i:03d}]" + "x" * 60))
+        await asyncio.sleep(0)
+    await s.finish(0)
+    joined = "".join(ch.messages)
+    for i in range(60):
+        assert joined.count(f"[{i:03d}]") == 1, f"marker {i} lost or duplicated"
+
+
+async def test_every_message_stays_within_discords_hard_cap():
+    ch = SuspendingChannel()
+    s = racing_sink(ch)
+    await s.start()
+    for _ in range(40):
+        await s.feed(Text("y" * 120))
+        await asyncio.sleep(0)
+    await s.finish(1, stderr_tail="e" * 500)
+    assert all(len(m) <= 2000 for m in ch.messages), \
+        [len(m) for m in ch.messages if len(m) > 2000]

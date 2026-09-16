@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
@@ -181,6 +182,7 @@ class Sink:
         self._started = 0.0
         self._tools = 0
         self.conversation_id: str | None = None
+        self._lock = asyncio.Lock()
 
     async def start(self) -> None:
         self._started = time.monotonic()
@@ -199,28 +201,37 @@ class Sink:
         else:
             text = piece.s
 
-        for sealed in self._chunker.feed(text):
-            await self._edit(self._handle, sealed)
-            self._handle = await self._send(self._chunker.current or "…")
-        self._dirty = True
+        # The chunker advance and the handle repoint must be atomic with
+        # respect to the pump, which reads both. Splitting them lets the pump
+        # write the next body onto the previous, already-sealed message.
+        async with self._lock:
+            for sealed in self._chunker.feed(text):
+                await self._edit(self._handle, sealed)
+                self._handle = await self._send(self._chunker.current or "…")
+            self._dirty = True
 
     async def finish(self, returncode: int, stderr_tail: str = "",
                      cancelled: bool = False) -> None:
-        if self._writer is not None:
-            self._writer.cancel()
-            self._writer = None
+        writer, self._writer = self._writer, None
+        if writer is not None:
+            writer.cancel()
+            # Awaiting the cancelled task guarantees no pump edit is still in
+            # flight; otherwise one can land after the footer and clobber it.
+            with contextlib.suppress(asyncio.CancelledError):
+                await writer
 
-        footer = self._footer(returncode, stderr_tail, cancelled)
-        bodies = self._chunker.flush()
-        body = bodies[0] if bodies else ""
+        async with self._lock:
+            footer = self._footer(returncode, stderr_tail, cancelled)
+            bodies = self._chunker.flush()
+            body = bodies[0] if bodies else ""
 
-        # flush() yields at most one body, so the footer joins it whenever
-        # the pair fits inside Discord's hard 2000-character message cap.
-        if len(body) + len(footer) <= 2000:
-            await self._edit(self._handle, (body + footer) or PLACEHOLDER)
-        else:
-            await self._edit(self._handle, body)
-            self._handle = await self._send(footer)
+            # flush() yields at most one body, so the footer joins it whenever
+            # the pair fits inside Discord's hard 2000-character message cap.
+            if len(body) + len(footer) <= 2000:
+                await self._edit(self._handle, (body + footer) or PLACEHOLDER)
+            else:
+                await self._edit(self._handle, body)
+                self._handle = await self._send(footer)
 
     def _footer(self, returncode: int, stderr_tail: str,
                 cancelled: bool) -> str:
@@ -241,9 +252,10 @@ class Sink:
         try:
             while True:
                 await asyncio.sleep(self._interval)
-                if self._dirty:
-                    self._dirty = False
-                    await self._edit(self._handle,
-                                     self._chunker.current or PLACEHOLDER)
+                async with self._lock:
+                    if self._dirty:
+                        self._dirty = False
+                        await self._edit(self._handle,
+                                         self._chunker.current or PLACEHOLDER)
         except asyncio.CancelledError:
             pass
