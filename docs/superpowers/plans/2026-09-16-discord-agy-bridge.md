@@ -140,7 +140,7 @@ git commit -m "docs: pin agy stream-json event schema from observed run"
 **Interfaces:**
 - Consumes: nothing.
 - Produces:
-  - `Config` frozen dataclass with fields `owner_id: str`, `members: frozenset[str]`, `channels: frozenset[str]`, `default_workspace: str`, `workspaces: dict[str, str]`, `agy_bin: str`, `token: str`
+  - `Config` frozen dataclass with fields `owner_id: str`, `members: frozenset[str]`, `channels: frozenset[str]`, `default_workspace: str`, `workspaces: Mapping[str, str]` (a read-only `MappingProxyType`), `agy_bin: str`, `token: str` (hidden from `repr`)
   - `load_config(path: Path, env: Mapping[str, str]) -> Config`
   - `tier_of(cfg: Config, user_id: str) -> str` returning `"owner"`, `"member"`, or `"stranger"`
   - `resolve_workspace(cfg: Config, name: str | None) -> str` returning an absolute path
@@ -275,6 +275,23 @@ def test_traversal_attempt_is_refused(cfg):
         resolve_workspace(cfg, "../../etc")
 
 
+def test_token_is_absent_from_the_repr(cfg):
+    assert "tok" not in repr(cfg)
+
+
+def test_workspace_allowlist_cannot_be_mutated(cfg):
+    with pytest.raises(TypeError):
+        cfg.workspaces["evil"] = "/etc"
+
+
+def test_relative_workspace_path_is_refused(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text(CONFIG_TEXT.replace('scratch = "/srv/agy/scratch"',
+                                     'scratch = "relative/path"'))
+    with pytest.raises(ValueError, match="absolute"):
+        load_config(p, {"DISCORD_TOKEN": "tok"})
+
+
 def test_default_workspace_must_exist_in_map(tmp_path: Path):
     p = tmp_path / "config.toml"
     p.write_text(CONFIG_TEXT.replace('default_workspace = "scratch"',
@@ -297,8 +314,9 @@ Expected: collection error, `ModuleNotFoundError: No module named 'agybot.config
 from __future__ import annotations
 
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Mapping
 
 
@@ -317,9 +335,12 @@ class Config:
     members: frozenset[str]
     channels: frozenset[str]
     default_workspace: str
-    workspaces: dict[str, str]
+    workspaces: Mapping[str, str]
     agy_bin: str
-    token: str
+    # field(repr=False) supplies no default, so token stays required and the
+    # argument order is unchanged. It keeps the live bot token out of any
+    # repr(), log line, or crash dump that happens to hold a Config.
+    token: str = field(repr=False)
 
 
 def load_config(path: Path, env: Mapping[str, str]) -> Config:
@@ -334,6 +355,12 @@ def load_config(path: Path, env: Mapping[str, str]) -> Config:
     if not workspaces:
         raise ValueError("config defines no [workspaces]")
 
+    relative = sorted(n for n, p in workspaces.items()
+                      if not Path(p).is_absolute())
+    if relative:
+        raise ValueError(
+            f"workspace paths must be absolute: {', '.join(relative)}")
+
     default_workspace = str(raw["default_workspace"])
     if default_workspace not in workspaces:
         raise ValueError(
@@ -345,7 +372,9 @@ def load_config(path: Path, env: Mapping[str, str]) -> Config:
         members=frozenset(str(m) for m in raw.get("members", [])),
         channels=frozenset(str(c) for c in raw.get("channels", [])),
         default_workspace=default_workspace,
-        workspaces=workspaces,
+        # frozen=True stops rebinding, not mutation. The allowlist is the
+        # access-control boundary, so it is made genuinely read-only here.
+        workspaces=MappingProxyType(workspaces),
         agy_bin=env.get("AGY_BIN", "agy"),
         token=token,
     )
@@ -378,7 +407,7 @@ Note that `resolve_workspace` needs no traversal-stripping logic: a dictionary l
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/test_config.py -v`
-Expected: 14 passed
+Expected: 17 passed
 
 - [ ] **Step 6: Write the configuration template**
 
@@ -2586,7 +2615,7 @@ from agybot.runner import (
 - [ ] **Step 5: Run the whole suite**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 121 passed
+Expected: 124 passed
 
 - [ ] **Step 6: Commit**
 
@@ -2727,7 +2756,7 @@ python3 -m venv .venv
 - [ ] **Step 3: Run the full suite one last time**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 121 passed
+Expected: 124 passed
 
 - [ ] **Step 4: Commit**
 
