@@ -185,12 +185,6 @@ def test_tool_done_is_not_rendered_twice():
     assert EventAdapter().feed(ev) == []
 
 
-def test_unknown_tool_state_is_surfaced_as_a_failure():
-    ev = step(step_type="tool", state="ERROR", tool_name="run_command",
-              tool_info={"parameters": {"Command": "false"}})
-    assert EventAdapter().feed(ev) == [Tool("run_command", "error", False)]
-
-
 def test_tool_without_recognised_parameters_has_an_empty_detail():
     ev = step(step_type="tool", state="ACTIVE", tool_name="mystery",
               tool_info={"parameters": {"Weird": "x"}})
@@ -219,14 +213,50 @@ def test_recorded_stream_produces_a_sane_piece_sequence():
         "every tool in the recorded turn succeeded, so none should be flagged"
 
 
-def test_multichunk_fixture_reassembles_by_concatenation():
-    """The sample fixture cannot tell append from replace: its one
-    text-bearing step emits everything in a single event. This fixture
-    can — step_index 3 arrives as five disjoint deltas."""
+def test_multichunk_fixture_reassembles_exactly():
+    """The sample fixture cannot tell append from replace: its one text-bearing
+    step emits everything in a single event. This fixture can — step_index 3
+    arrives as five disjoint deltas whose concatenation equals the turn's
+    result.response, so the assertion is exact rather than a containment check
+    that duplication could also satisfy."""
+    events = [json.loads(line) for line in MULTICHUNK.read_text().splitlines()
+              if line.strip()]
+    expected = next(e["result"]["response"] for e in events
+                    if e.get("event") == "result")
     texts = [p.s for p in replay(MULTICHUNK) if isinstance(p, Text)]
     assert len(texts) >= 2, "this fixture must exercise multi-chunk text"
-    joined = "".join(texts)
-    assert "Starting the check now." in joined
-    assert joined.rstrip().endswith("hello.")
-    # A replace-instead-of-append adapter would emit only the last chunk.
-    assert len(joined) > len(texts[-1])
+    assert "".join(texts) == expected
+
+
+def test_unknown_tool_state_renders_nothing():
+    ev = step(step_type="tool", state="PENDING", tool_name="x",
+              tool_info={"parameters": {}})
+    assert EventAdapter().feed(ev) == []
+
+
+def test_a_non_dict_event_is_ignored():
+    a = EventAdapter()
+    for junk in ("a string", ["a", "list"], 42, None):
+        assert a.feed(junk) == []
+
+
+def test_a_non_dict_step_update_is_ignored():
+    assert EventAdapter().feed(
+        {"event": "step_update", "step_update": "oops"}) == []
+
+
+def test_a_non_dict_tool_info_does_not_crash():
+    ev = step(step_type="tool", state="ACTIVE", tool_name="x",
+              tool_info="oops")
+    assert EventAdapter().feed(ev) == [Tool("x", "", None)]
+
+
+def test_non_dict_parameters_do_not_crash():
+    ev = step(step_type="tool", state="ACTIVE", tool_name="x",
+              tool_info={"parameters": ["a", "b"]})
+    assert EventAdapter().feed(ev) == [Tool("x", "", None)]
+
+
+def test_a_non_string_text_delta_is_ignored():
+    assert EventAdapter().feed(
+        step(step_type="agent_response", state="ACTIVE", text_delta=42)) == []

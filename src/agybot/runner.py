@@ -59,7 +59,13 @@ class EventAdapter:
     def __init__(self) -> None:
         self._conversation_sent = False
 
-    def feed(self, ev: dict) -> list[Piece]:
+    def feed(self, ev: object) -> list[Piece]:
+        # Runs per line of a live subprocess stream, so it must never raise:
+        # an exception here aborts the user's turn mid-answer. Every field is
+        # type-checked rather than merely presence-checked.
+        if not isinstance(ev, dict):
+            return []
+
         kind = ev.get("event")
 
         if kind == "init":
@@ -70,7 +76,8 @@ class EventAdapter:
             return []
 
         if kind == "step_update":
-            return self._step(ev.get("step_update") or {})
+            su = ev.get("step_update")
+            return self._step(su) if isinstance(su, dict) else []
 
         return []
 
@@ -80,22 +87,24 @@ class EventAdapter:
         if step_type == "agent_response":
             # text_delta is incremental and frequently absent; emitting each
             # delta in arrival order reconstructs the response exactly.
-            delta = su.get("text_delta") or ""
-            return [Text(delta)] if delta else []
+            delta = su.get("text_delta")
+            return [Text(delta)] if isinstance(delta, str) and delta else []
 
         if step_type == "tool":
             state = su.get("state")
-            name = str(su.get("tool_name") or "tool")
-            info = su.get("tool_info") or {}
-            detail = _detail(info.get("parameters") or {})
             if state == "ACTIVE":
+                name = str(su.get("tool_name") or "tool")
+                info = su.get("tool_info")
+                params = info.get("parameters") if isinstance(info, dict) else None
+                detail = _detail(params if isinstance(params, dict) else {})
                 return [Tool(name, detail, None)]
-            if state == "DONE":
-                return []           # already announced when it started
-            # Tool failure was never observed during the schema probe, so any
-            # state that is neither ACTIVE nor DONE is surfaced rather than
-            # silently dropped. See docs/agy-stream-schema.md, question 4.
-            return [Tool(name, str(state).lower(), False)]
+            # DONE renders nothing, because the call was announced when it
+            # started. Any other state renders nothing either: tool failure
+            # signalling was never observed, and docs/agy-stream-schema.md
+            # question 4 says to treat unknown states as unhandled rather than
+            # assume they mean failure. When a real failing tool is captured,
+            # add the branch then.
+            return []
 
         return []
 
