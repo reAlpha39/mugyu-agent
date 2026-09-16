@@ -2331,12 +2331,18 @@ class Turn:
 
             returncode = await self._proc.wait()
             stderr = (await stderr_task).decode("utf-8", "replace")
-        except BaseException:
+        except BaseException as exc:
             # Anything escaping this loop — a Discord failure raised by the
             # sink, a stream overrun, cancellation of this coroutine — must
             # not leave the process group running. start_new_session means
             # nothing else will ever reap it.
             await self._kill()
+            # Leave the user a footer rather than a message frozen at the
+            # placeholder. A sink that is itself the cause may raise again;
+            # that must never mask the original failure.
+            with contextlib.suppress(Exception):
+                await self._sink.finish(-1, f"{type(exc).__name__}: {exc}",
+                                        cancelled=self.cancelled)
             raise
         finally:
             watchdog.cancel()
@@ -2383,7 +2389,7 @@ The signal goes to the process group, not the process, because `start_new_sessio
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 58 passed in `test_runner.py`, 126 across the suite
+Expected: 60 passed in `test_runner.py`, 128 across the suite
 
 - [ ] **Step 6: Commit**
 
@@ -2486,6 +2492,7 @@ Expected: collection error, `ModuleNotFoundError: No module named 'agybot.bot'`
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
@@ -2614,44 +2621,58 @@ class AgyBot(discord.Client):
             if row is None:
                 return
 
+            async def send(content: str):
+                return await thread.send(content)
+
+            async def edit(handle, content: str) -> None:
+                await handle.edit(content=content)
+
+            sink = Sink(send, edit)
+            turn = Turn(
+                argv=build_argv(self.cfg.agy_bin, prompt, row.workspace,
+                                row.conversation_id, tier),
+                cwd=row.workspace,
+                env=minimal_env(os.environ),
+                sink=sink,
+                adapter=EventAdapter(),
+            )
+            # Registered before queueing, so a cancel arriving while this
+            # request waits for a slot is honoured instead of silently
+            # ignored. Turn.cancel() on an unspawned turn just sets the flag.
+            self.turns[thread.id] = turn
+            self.owners[thread.id] = author_id
+
             notice = None
             if self.slots.would_block(tier):
                 notice = await thread.send(
                     f"⏳ queued · {self.slots.ahead(tier)} ahead")
 
-            await self.slots.acquire(tier)
+            try:
+                await self.slots.acquire(tier)
+            except BaseException:
+                self.turns.pop(thread.id, None)
+                self.owners.pop(thread.id, None)
+                raise
+
             try:
                 if notice is not None:
-                    await notice.delete()
+                    # Losing the notice must not lose the request.
+                    with contextlib.suppress(Exception):
+                        await notice.delete()
 
-                async def send(content: str):
-                    return await thread.send(content)
+                if turn.cancelled:
+                    await thread.send("🛑 Cancelled before it started.")
+                    return
 
-                async def edit(handle, content: str) -> None:
-                    await handle.edit(content=content)
-
-                sink = Sink(send, edit)
-                turn = Turn(
-                    argv=build_argv(self.cfg.agy_bin, prompt, row.workspace,
-                                    row.conversation_id, tier),
-                    cwd=row.workspace,
-                    env=minimal_env(os.environ),
-                    sink=sink,
-                    adapter=EventAdapter(),
-                )
-                self.turns[thread.id] = turn
-                self.owners[thread.id] = author_id
-                try:
-                    await turn.run()
-                finally:
-                    self.turns.pop(thread.id, None)
-                    self.owners.pop(thread.id, None)
+                await turn.run()
 
                 if sink.conversation_id and not row.conversation_id:
                     self.store.set_conversation(str(thread.id), sink.conversation_id)
                 self.store.touch(str(thread.id))
             finally:
                 self.slots.release()
+                self.turns.pop(thread.id, None)
+                self.owners.pop(thread.id, None)
 
     async def _cancel(self, thread: discord.Thread, user_id: str) -> None:
         turn = self.turns.get(thread.id)
@@ -2687,8 +2708,8 @@ if __name__ == "__main__":
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `.venv/bin/pytest tests/test_bot.py -v`
-Expected: 11 passed
+Run: `.venv/bin/pytest tests/ -v`
+Expected: 11 passed in `tests/test_bot.py`, 139 across the suite
 
 - [ ] **Step 5: Commit**
 
@@ -2857,7 +2878,7 @@ from agybot.runner import (
 - [ ] **Step 5: Run the whole suite**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 143 passed
+Expected: 145 passed
 
 - [ ] **Step 6: Commit**
 
@@ -2998,7 +3019,7 @@ python3 -m venv .venv
 - [ ] **Step 3: Run the full suite one last time**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 143 passed
+Expected: 145 passed
 
 - [ ] **Step 4: Commit**
 
