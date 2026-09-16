@@ -955,8 +955,9 @@ def ch():
 
 
 def sink_for(ch) -> Sink:
-    # interval=0 makes the writer flush on every tick, so tests never sleep.
-    return Sink(ch.send, ch.edit, interval=0)
+    # A short interval keeps tests fast without spinning the writer hot.
+    # interval=0 would busy-loop asyncio.sleep(0) for the whole turn.
+    return Sink(ch.send, ch.edit, interval=0.01)
 
 
 def test_fmt_elapsed_under_a_minute():
@@ -1841,7 +1842,7 @@ class RecordingChannel:
 
 def turn_for(mode: str, tmp_path, wall_timeout: float = 960, **env_extra):
     ch = RecordingChannel()
-    sink = Sink(ch.send, ch.edit, interval=0)
+    sink = Sink(ch.send, ch.edit, interval=0.01)
     env = {"FAKE_AGY_MODE": mode, "PATH": os.environ["PATH"], **env_extra}
     t = Turn([sys.executable, FAKE], cwd=str(tmp_path), env=env,
              sink=sink, wall_timeout=wall_timeout)
