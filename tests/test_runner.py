@@ -436,7 +436,7 @@ async def test_cancel_kills_the_whole_process_group(tmp_path):
 async def test_wall_timeout_kills_a_wedged_turn(tmp_path):
     t, _, ch = turn_for("slow", tmp_path, wall_timeout=0.5)
     assert await asyncio.wait_for(t.run(), 10) != 0
-    assert "-# 🛑 cancelled" in "\n".join(ch.messages)
+    assert "-# ⏱️ timed out" in "\n".join(ch.messages)
 
 
 class ExplodingSink:
@@ -457,8 +457,8 @@ class ExplodingSink:
             raise RuntimeError("discord exploded")
 
     async def finish(self, returncode: int, stderr_tail: str = "",
-                     cancelled: bool = False) -> None:
-        self.finished = (returncode, stderr_tail, cancelled)
+                     cancelled: bool = False, timed_out: bool = False) -> None:
+        self.finished = (returncode, stderr_tail, cancelled, timed_out)
 
 
 async def test_a_sink_failure_does_not_leak_the_process(tmp_path):

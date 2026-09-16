@@ -211,7 +211,7 @@ class Sink:
             self._dirty = True
 
     async def finish(self, returncode: int, stderr_tail: str = "",
-                     cancelled: bool = False) -> None:
+                     cancelled: bool = False, timed_out: bool = False) -> None:
         writer, self._writer = self._writer, None
         if writer is not None:
             writer.cancel()
@@ -221,7 +221,7 @@ class Sink:
                 await writer
 
         async with self._lock:
-            footer = self._footer(returncode, stderr_tail, cancelled)
+            footer = self._footer(returncode, stderr_tail, cancelled, timed_out)
             bodies = self._chunker.flush()
             body = bodies[0] if bodies else ""
 
@@ -234,10 +234,12 @@ class Sink:
                 self._handle = await self._send(footer)
 
     def _footer(self, returncode: int, stderr_tail: str,
-                cancelled: bool) -> str:
+                cancelled: bool, timed_out: bool = False) -> str:
         elapsed = fmt_elapsed(time.monotonic() - self._started)
         cid = self.conversation_id or "unknown"
-        if cancelled:
+        if timed_out:
+            head = "-# ⏱️ timed out"
+        elif cancelled:
             head = "-# 🛑 cancelled"
         elif returncode == 0:
             head = "-# ✅"

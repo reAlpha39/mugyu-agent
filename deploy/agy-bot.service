@@ -21,6 +21,9 @@ PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
 ReadWritePaths=/srv/agy
+# The agent runs as this same uid, so without this it could read the bot's
+# own /proc/<pid>/environ and recover DISCORD_TOKEN.
+ProtectProc=invisible
 
 [Install]
 WantedBy=multi-user.target

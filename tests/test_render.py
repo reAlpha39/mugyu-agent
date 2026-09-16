@@ -292,6 +292,15 @@ async def test_cancelled_footer(ch):
     assert "-# 🛑 cancelled" in ch.messages[-1]
 
 
+async def test_timed_out_footer_is_distinct_from_cancelled(ch):
+    s = sink_for(ch)
+    await s.start()
+    await s.feed(Text("partial"))
+    await s.finish(-15, cancelled=True, timed_out=True)
+    assert "-# ⏱️ timed out" in ch.messages[-1]
+    assert "cancelled" not in ch.messages[-1]
+
+
 async def test_tool_count_appears_in_the_footer(ch):
     s = sink_for(ch)
     await s.start()

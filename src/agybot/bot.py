@@ -27,6 +27,7 @@ MENTION_RE = re.compile(r"<@!?(\d+)>")
 WORKSPACE_RE = re.compile(r"^\[([A-Za-z0-9._-]+)\]\s*")
 THREAD_NAME_MAX = 60
 STOP_COMMAND = "!stop"
+RESET_COMMAND = "!reset"
 CANCEL_EMOJI = "❌"
 
 
@@ -119,13 +120,22 @@ class AgyBot(discord.Client):
             await self._cancel(thread, str(message.author.id))
             return
 
+        if message.content.strip() == RESET_COMMAND:
+            await self._reset(thread, row, str(message.author.id))
+            return
+
         tier = tier_of(self.cfg, str(message.author.id))
         if tier == "stranger":
             await message.add_reaction("🚫")
             return
 
-        await self._run(thread, message.content.strip(), tier,
-                        str(message.author.id))
+        content = message.content.strip()
+        if not content:
+            # An attachment-only or sticker-only post has no prompt to run.
+            # No reply: a reply on every image post would be noise.
+            return
+
+        await self._run(thread, content, tier, str(message.author.id))
 
     async def _run(self, thread: discord.Thread, prompt: str,
                    tier: str, author_id: str) -> None:
@@ -178,12 +188,15 @@ class AgyBot(discord.Client):
                     return
 
                 await turn.run()
-
+            finally:
+                # Persisted here, not after turn.run(), so a turn that raises
+                # still records the conversation agy already created —
+                # otherwise the next message starts a second conversation and
+                # the first is leaked.
                 if sink.conversation_id and not row.conversation_id:
                     self.store.set_conversation(str(thread.id),
                                                 sink.conversation_id)
                 self.store.touch(str(thread.id))
-            finally:
                 self.slots.release()
                 self.turns.pop(thread.id, None)
                 self.owners.pop(thread.id, None)
@@ -197,6 +210,20 @@ class AgyBot(discord.Client):
             await thread.send("That is not your turn to cancel.")
             return
         await turn.cancel()
+
+    async def _reset(self, thread: discord.Thread, row,
+                     user_id: str) -> None:
+        """Forget this thread's agy conversation without closing the thread.
+
+        Recovery path for a conversation that no longer exists on disk, which
+        would otherwise make every later message in the thread fail against a
+        dead id.
+        """
+        if tier_of(self.cfg, user_id) != "owner" and row.created_by != user_id:
+            await thread.send("That is not your thread to reset.")
+            return
+        self.store.set_conversation(str(thread.id), "")
+        await thread.send("🔄 Next message starts a fresh conversation.")
 
     async def on_raw_reaction_add(
             self, payload: discord.RawReactionActionEvent) -> None:

@@ -10,9 +10,12 @@ import shutil
 import signal
 import subprocess
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, TYPE_CHECKING
 
 from agybot.render import Meta, Piece, Text, Tool
+
+if TYPE_CHECKING:
+    from agybot.config import Config
 
 log = logging.getLogger("agybot.runner")
 
@@ -207,6 +210,7 @@ class Turn:
         self._wall_timeout = wall_timeout
         self._proc: asyncio.subprocess.Process | None = None
         self.cancelled = False
+        self.timed_out = False
 
     async def run(self) -> int:
         await self._sink.start()
@@ -253,7 +257,8 @@ class Turn:
             # that must never mask the original failure.
             with contextlib.suppress(Exception):
                 await self._sink.finish(-1, f"{type(exc).__name__}: {exc}",
-                                        cancelled=self.cancelled)
+                                        cancelled=self.cancelled,
+                                        timed_out=self.timed_out)
             raise
         finally:
             watchdog.cancel()
@@ -265,7 +270,8 @@ class Turn:
                     await stderr_task
 
         await self._sink.finish(returncode, stderr[-STDERR_KEEP:],
-                                cancelled=self.cancelled)
+                                cancelled=self.cancelled,
+                                timed_out=self.timed_out)
         return returncode
 
     async def cancel(self) -> None:
@@ -274,6 +280,7 @@ class Turn:
 
     async def _watchdog(self) -> None:
         await asyncio.sleep(self._wall_timeout)
+        self.timed_out = True
         self.cancelled = True
         await self._kill()
 
@@ -300,7 +307,7 @@ class PreflightError(Exception):
     """A startup condition that makes the bot unable to do its job."""
 
 
-def preflight(cfg) -> None:
+def preflight(cfg: "Config") -> None:
     """Refuse to boot on a misconfigured host."""
     resolved = shutil.which(cfg.agy_bin) or cfg.agy_bin
     path = Path(resolved)
