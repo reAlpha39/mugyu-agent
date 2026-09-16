@@ -1,9 +1,10 @@
+import asyncio
 import json
 from pathlib import Path
 
 import pytest
 
-from agybot.runner import EventAdapter, build_argv, minimal_env
+from agybot.runner import EventAdapter, Slots, build_argv, minimal_env
 from agybot.render import Meta, Text, Tool
 
 
@@ -260,3 +261,95 @@ def test_non_dict_parameters_do_not_crash():
 def test_a_non_string_text_delta_is_ignored():
     assert EventAdapter().feed(
         step(step_type="agent_response", state="ACTIVE", text_delta=42)) == []
+
+
+async def test_owner_may_take_all_three_slots():
+    s = Slots()
+    for _ in range(3):
+        await asyncio.wait_for(s.acquire("owner"), 0.1)
+    assert s.running == 3
+
+
+async def test_owner_blocks_at_the_fourth():
+    s = Slots()
+    for _ in range(3):
+        await s.acquire("owner")
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(s.acquire("owner"), 0.05)
+
+
+async def test_member_may_take_only_two():
+    s = Slots()
+    await s.acquire("member")
+    await s.acquire("member")
+    assert s.running == 2
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(s.acquire("member"), 0.05)
+
+
+async def test_owner_is_admitted_while_members_hold_two():
+    s = Slots()
+    await s.acquire("member")
+    await s.acquire("member")
+    await asyncio.wait_for(s.acquire("owner"), 0.1)
+    assert s.running == 3
+
+
+async def test_release_admits_a_waiter():
+    s = Slots()
+    for _ in range(3):
+        await s.acquire("owner")
+    waiter = asyncio.create_task(s.acquire("owner"))
+    await asyncio.sleep(0)
+    s.release()
+    await asyncio.wait_for(waiter, 0.1)
+    assert s.running == 3
+
+
+async def test_owner_overtakes_a_waiting_member():
+    s = Slots()
+    await s.acquire("member")
+    await s.acquire("member")
+    await s.acquire("owner")                       # full at 3
+
+    member_waiter = asyncio.create_task(s.acquire("member"))
+    await asyncio.sleep(0)
+    s.release()                                    # running drops to 2
+
+    # A member still may not enter at 2; the owner may.
+    await asyncio.wait_for(s.acquire("owner"), 0.1)
+    assert not member_waiter.done()
+    member_waiter.cancel()
+
+
+async def test_ahead_counts_queued_requests():
+    s = Slots()
+    for _ in range(3):
+        await s.acquire("owner")
+    w1 = asyncio.create_task(s.acquire("owner"))
+    w2 = asyncio.create_task(s.acquire("owner"))
+    await asyncio.sleep(0)
+    assert s.ahead("owner") == 2
+    for w in (w1, w2):
+        w.cancel()
+
+
+async def test_ahead_is_zero_when_idle():
+    assert Slots().ahead("member") == 0
+
+
+async def test_would_block_tracks_the_tier_thresholds():
+    s = Slots()
+    assert not s.would_block("member")
+    await s.acquire("member")
+    await s.acquire("member")
+    assert s.would_block("member")
+    assert not s.would_block("owner")
+    await s.acquire("owner")
+    assert s.would_block("owner")
+
+
+async def test_release_below_zero_is_refused():
+    s = Slots()
+    with pytest.raises(RuntimeError):
+        s.release()

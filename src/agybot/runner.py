@@ -1,6 +1,7 @@
 """Process construction and lifecycle for the agy CLI."""
 from __future__ import annotations
 
+import asyncio
 from typing import Mapping
 
 from agybot.render import Meta, Piece, Text, Tool
@@ -114,3 +115,61 @@ def _detail(parameters: dict) -> str:
         if parameters.get(key):
             return str(parameters[key])[:80]
     return ""
+
+
+class Slots:
+    """Bounded concurrency with a slot held back for the owner.
+
+    The owner is admitted while fewer than max_total turns run; a member
+    while fewer than (max_total - reserved_owner) run. No priority queue is
+    needed: the differing thresholds mean a woken member simply fails its
+    own check and waits again, whatever the wake order.
+    """
+
+    def __init__(self, max_total: int = 3, reserved_owner: int = 1) -> None:
+        self._max_total = max_total
+        self._member_cap = max_total - reserved_owner
+        self._running = 0
+        self._waiting = {"owner": 0, "member": 0}
+        self._cond = asyncio.Condition()
+
+    @property
+    def running(self) -> int:
+        return self._running
+
+    def _cap(self, tier: str) -> int:
+        return self._max_total if tier == "owner" else self._member_cap
+
+    def ahead(self, tier: str) -> int:
+        """Queued requests that will be considered before a new one."""
+        if tier == "owner":
+            return self._waiting["owner"]
+        return self._waiting["owner"] + self._waiting["member"]
+
+    def would_block(self, tier: str) -> bool:
+        """True if acquire() would wait. Callers use this to warn the user."""
+        return self._running >= self._cap(tier)
+
+    async def acquire(self, tier: str) -> None:
+        async with self._cond:
+            if self._running < self._cap(tier):
+                self._running += 1
+                return
+            self._waiting[tier] += 1
+            try:
+                await self._cond.wait_for(
+                    lambda: self._running < self._cap(tier))
+                self._running += 1
+            finally:
+                self._waiting[tier] -= 1
+
+    def release(self) -> None:
+        if self._running <= 0:
+            raise RuntimeError("release() called with no turn running")
+        self._running -= 1
+
+        async def wake() -> None:
+            async with self._cond:
+                self._cond.notify_all()
+
+        asyncio.get_running_loop().create_task(wake())
