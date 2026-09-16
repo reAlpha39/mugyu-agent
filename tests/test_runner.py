@@ -521,3 +521,54 @@ async def test_a_sink_failing_in_finish_does_not_mask_the_original_error(
     # The original RuntimeError must surface, not the ValueError from finish.
     with pytest.raises(RuntimeError):
         await asyncio.wait_for(t.run(), 15)
+
+from agybot.config import Config
+from agybot.runner import preflight, PreflightError, sweep_stray_agy
+
+
+def cfg_with(tmp_path, agy_bin: str, workspaces: dict) -> Config:
+    return Config(
+        owner_id="1", members=frozenset(), channels=frozenset(),
+        default_workspace=next(iter(workspaces)), workspaces=workspaces,
+        agy_bin=agy_bin, token="tok",
+    )
+
+
+def test_preflight_passes_with_a_real_binary_and_directory(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    preflight(cfg_with(tmp_path, sys.executable, {"ws": str(ws)}))
+
+
+def test_preflight_rejects_a_missing_binary(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    with pytest.raises(PreflightError, match="agy"):
+        preflight(cfg_with(tmp_path, "/nonexistent/agy", {"ws": str(ws)}))
+
+
+def test_preflight_rejects_a_non_executable_binary(tmp_path):
+    fake = tmp_path / "agy"
+    fake.write_text("#!/bin/sh\n")
+    fake.chmod(0o644)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    with pytest.raises(PreflightError, match="executable"):
+        preflight(cfg_with(tmp_path, str(fake), {"ws": str(ws)}))
+
+
+def test_preflight_rejects_a_missing_workspace(tmp_path):
+    with pytest.raises(PreflightError, match="does not exist"):
+        preflight(cfg_with(tmp_path, sys.executable,
+                           {"ws": str(tmp_path / "absent")}))
+
+
+def test_preflight_rejects_a_workspace_that_is_a_file(tmp_path):
+    f = tmp_path / "afile"
+    f.write_text("x")
+    with pytest.raises(PreflightError, match="not a directory"):
+        preflight(cfg_with(tmp_path, sys.executable, {"ws": str(f)}))
+
+
+def test_sweep_is_harmless_when_nothing_matches():
+    assert sweep_stray_agy("/definitely/not/a/real/binary/name") == 0

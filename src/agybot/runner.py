@@ -5,7 +5,10 @@ import asyncio
 import contextlib
 import json
 import os
+import shutil
 import signal
+import subprocess
+from pathlib import Path
 from typing import Mapping
 
 from agybot.render import Meta, Piece, Text, Tool
@@ -287,3 +290,43 @@ class Turn:
         except asyncio.TimeoutError:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(pgid, signal.SIGKILL)
+
+class PreflightError(Exception):
+    """A startup condition that makes the bot unable to do its job."""
+
+
+def preflight(cfg) -> None:
+    """Refuse to boot on a misconfigured host."""
+    resolved = shutil.which(cfg.agy_bin) or cfg.agy_bin
+    path = Path(resolved)
+    if not path.exists():
+        raise PreflightError(
+            f"agy binary not found: {cfg.agy_bin!r}. "
+            "Install it or set AGY_BIN."
+        )
+    if not os.access(path, os.X_OK):
+        raise PreflightError(f"agy binary is not executable: {path}")
+
+    for name, location in cfg.workspaces.items():
+        p = Path(location)
+        if not p.exists():
+            raise PreflightError(
+                f"workspace {name!r} does not exist: {location}")
+        if not p.is_dir():
+            raise PreflightError(
+                f"workspace {name!r} is not a directory: {location}")
+
+
+def sweep_stray_agy(agy_bin: str) -> int:
+    """Kill agy processes this user left behind after an unclean shutdown.
+
+    The bot is the only thing that should ever run `agy -p` as the service
+    user, so matching on that pattern is safe. Do not use the service
+    account for interactive agy sessions.
+    """
+    pattern = f"{Path(agy_bin).name} -p"
+    result = subprocess.run(
+        ["pkill", "-u", str(os.getuid()), "-f", pattern],
+        capture_output=True,
+    )
+    return 1 if result.returncode == 0 else 0

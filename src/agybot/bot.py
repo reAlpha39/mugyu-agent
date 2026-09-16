@@ -15,7 +15,10 @@ from agybot.config import (
     Config, UnknownWorkspace, load_config, resolve_workspace, tier_of,
 )
 from agybot.render import Sink
-from agybot.runner import EventAdapter, Slots, Turn, build_argv, minimal_env
+from agybot.runner import (
+    EventAdapter, Slots, Turn, build_argv, minimal_env, preflight,
+    sweep_stray_agy,
+)
 from agybot.state import Store
 
 log = logging.getLogger("agybot")
@@ -209,6 +212,10 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO)
     cfg = load_config(Path(os.environ.get("AGY_CONFIG", "config.toml")),
                       os.environ)
+    preflight(cfg)
+    swept = sweep_stray_agy(cfg.agy_bin)
+    if swept:
+        log.warning("killed stray agy processes left by a previous run")
     store = Store(os.environ.get("AGY_DB", "state.db"))
     AgyBot(cfg, store).run(cfg.token)
 
