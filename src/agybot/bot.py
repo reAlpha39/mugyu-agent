@@ -227,7 +227,11 @@ class AgyBot(discord.Client):
                     await thread.send("🛑 Cancelled before it started.")
                     return
 
-                await turn.run()
+                # Discord's own typing indicator, refreshed by discord.py for
+                # as long as the turn runs. Editing the live message does not
+                # clear it, so it persists across the whole turn.
+                async with thread.typing():
+                    await turn.run()
             finally:
                 try:
                     # Persist even when the turn failed: agy created the
