@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
@@ -130,44 +131,59 @@ class AgyBot(discord.Client):
             if row is None:
                 return
 
+            async def send(content: str):
+                return await thread.send(content)
+
+            async def edit(handle, content: str) -> None:
+                await handle.edit(content=content)
+
+            sink = Sink(send, edit)
+            turn = Turn(
+                argv=build_argv(self.cfg.agy_bin, prompt, row.workspace,
+                                row.conversation_id, tier),
+                cwd=row.workspace,
+                env=minimal_env(os.environ),
+                sink=sink,
+                adapter=EventAdapter(),
+            )
+            # Registered before queueing, so a cancel arriving while this
+            # request waits for a slot is honoured instead of silently
+            # ignored. Turn.cancel() on an unspawned turn just sets the flag.
+            self.turns[thread.id] = turn
+            self.owners[thread.id] = author_id
+
             notice = None
             if self.slots.would_block(tier):
                 notice = await thread.send(
                     f"⏳ queued · {self.slots.ahead(tier)} ahead")
 
-            await self.slots.acquire(tier)
+            try:
+                await self.slots.acquire(tier)
+            except BaseException:
+                self.turns.pop(thread.id, None)
+                self.owners.pop(thread.id, None)
+                raise
+
             try:
                 if notice is not None:
-                    await notice.delete()
+                    # Losing the notice must not lose the request.
+                    with contextlib.suppress(Exception):
+                        await notice.delete()
 
-                async def send(content: str):
-                    return await thread.send(content)
+                if turn.cancelled:
+                    await thread.send("🛑 Cancelled before it started.")
+                    return
 
-                async def edit(handle, content: str) -> None:
-                    await handle.edit(content=content)
-
-                sink = Sink(send, edit)
-                turn = Turn(
-                    argv=build_argv(self.cfg.agy_bin, prompt, row.workspace,
-                                    row.conversation_id, tier),
-                    cwd=row.workspace,
-                    env=minimal_env(os.environ),
-                    sink=sink,
-                    adapter=EventAdapter(),
-                )
-                self.turns[thread.id] = turn
-                self.owners[thread.id] = author_id
-                try:
-                    await turn.run()
-                finally:
-                    self.turns.pop(thread.id, None)
-                    self.owners.pop(thread.id, None)
+                await turn.run()
 
                 if sink.conversation_id and not row.conversation_id:
-                    self.store.set_conversation(str(thread.id), sink.conversation_id)
+                    self.store.set_conversation(str(thread.id),
+                                                sink.conversation_id)
                 self.store.touch(str(thread.id))
             finally:
                 self.slots.release()
+                self.turns.pop(thread.id, None)
+                self.owners.pop(thread.id, None)
 
     async def _cancel(self, thread: discord.Thread, user_id: str) -> None:
         turn = self.turns.get(thread.id)

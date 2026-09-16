@@ -236,12 +236,18 @@ class Turn:
 
             returncode = await self._proc.wait()
             stderr = (await stderr_task).decode("utf-8", "replace")
-        except BaseException:
+        except BaseException as exc:
             # Anything escaping this loop — a Discord failure raised by the
             # sink, a stream overrun, cancellation of this coroutine — must
             # not leave the process group running. start_new_session means
             # nothing else will ever reap it.
             await self._kill()
+            # Leave the user a footer rather than a message frozen at the
+            # placeholder. A sink that is itself the cause may raise again;
+            # that must never mask the original failure.
+            with contextlib.suppress(Exception):
+                await self._sink.finish(-1, f"{type(exc).__name__}: {exc}",
+                                        cancelled=self.cancelled)
             raise
         finally:
             watchdog.cancel()

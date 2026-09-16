@@ -446,6 +446,7 @@ class ExplodingSink:
         self.conversation_id = None
         self._seen = 0
         self._fail_on = fail_on
+        self.finished = None
 
     async def start(self) -> None:
         pass
@@ -455,8 +456,9 @@ class ExplodingSink:
         if self._seen >= self._fail_on:
             raise RuntimeError("discord exploded")
 
-    async def finish(self, *a, **k) -> None:
-        pass
+    async def finish(self, returncode: int, stderr_tail: str = "",
+                     cancelled: bool = False) -> None:
+        self.finished = (returncode, stderr_tail, cancelled)
 
 
 async def test_a_sink_failure_does_not_leak_the_process(tmp_path):
@@ -495,3 +497,27 @@ async def test_a_line_past_the_default_stream_limit_is_read(tmp_path):
     t, _, ch = turn_for("bigline", tmp_path)
     assert await asyncio.wait_for(t.run(), 15) == 0
     assert "Z" * 100 in "".join(ch.messages)
+
+
+async def test_a_sink_failure_still_reports_a_footer(tmp_path):
+    env = {"FAKE_AGY_MODE": "slow", "PATH": os.environ["PATH"]}
+    sink = ExplodingSink()
+    t = Turn([sys.executable, FAKE], cwd=str(tmp_path), env=env, sink=sink)
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(t.run(), 15)
+    assert sink.finished is not None, "the user was left with no footer"
+    assert sink.finished[0] != 0
+
+
+async def test_a_sink_failing_in_finish_does_not_mask_the_original_error(
+        tmp_path):
+    class DoublyExploding(ExplodingSink):
+        async def finish(self, *a, **k):
+            raise ValueError("finish exploded too")
+
+    env = {"FAKE_AGY_MODE": "slow", "PATH": os.environ["PATH"]}
+    t = Turn([sys.executable, FAKE], cwd=str(tmp_path), env=env,
+             sink=DoublyExploding())
+    # The original RuntimeError must surface, not the ValueError from finish.
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(t.run(), 15)
