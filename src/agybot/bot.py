@@ -281,7 +281,14 @@ class AgyBot(discord.Client):
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
+    # AGY_LOG_LEVEL=DEBUG turns on per-message receipt logging, which is what
+    # distinguishes "the mention never arrived" from "it arrived and was
+    # ignored" — the single most useful thing to know when the bot appears
+    # silent. discord.py's own loggers stay at INFO, since their DEBUG output
+    # is gateway noise that buries ours.
+    level = os.environ.get("AGY_LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(level=getattr(logging, level, logging.INFO))
+    logging.getLogger("discord").setLevel(logging.INFO)
     cfg = load_config(Path(os.environ.get("AGY_CONFIG", "config.toml")),
                       os.environ)
     preflight(cfg)
