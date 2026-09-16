@@ -6,3 +6,4 @@ config.toml
 *.db-wal
 *.db-shm
 .superpowers/
+*.egg-info/
