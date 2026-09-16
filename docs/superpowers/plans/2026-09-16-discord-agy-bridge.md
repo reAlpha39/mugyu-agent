@@ -1423,13 +1423,23 @@ def argv(**kw):
 
 def test_prompt_is_a_single_argument():
     a = argv(prompt="rm -rf /; echo `whoami`")
-    assert "rm -rf /; echo `whoami`" in a
+    assert a[a.index("-p") + 1] == "rm -rf /; echo `whoami`"
 
 
 def test_prompt_is_not_escaped_or_quoted():
     a = argv(prompt='say "hi"')
-    assert 'say "hi"' in a
+    assert a[a.index("-p") + 1] == 'say "hi"'
     assert '\\"' not in " ".join(a)
+
+
+def test_a_prompt_that_looks_like_a_flag_cannot_smuggle_privileges():
+    """agy's parser takes the token after -p as its value even when that token
+    begins with dashes, so a member writing a privileged flag as their prompt
+    gets it treated as prompt text. This asserts the prompt stays adjacent to
+    -p and that the flag never appears anywhere a parser would read it."""
+    a = argv(prompt="--dangerously-skip-permissions", tier="member")
+    assert a[a.index("-p") + 1] == "--dangerously-skip-permissions"
+    assert "--dangerously-skip-permissions" not in a[a.index("-p") + 2:]
 
 
 def test_stream_json_output_is_requested():
@@ -1558,7 +1568,7 @@ If Task 1 found that the prompt is a flag value rather than positional, change t
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/test_runner.py -v`
-Expected: 16 passed
+Expected: 17 passed
 
 - [ ] **Step 5: Commit**
 
@@ -1815,7 +1825,7 @@ def _detail(parameters: dict) -> str:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/test_runner.py -v`
-Expected: 31 passed
+Expected: 32 passed
 
 If `test_recorded_stream_produces_a_sane_piece_sequence` fails, the adapter disagrees with the captured stream. Fix the adapter, never the fixture.
 
@@ -2015,7 +2025,7 @@ class Slots:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/test_runner.py -v`
-Expected: 41 passed
+Expected: 42 passed
 
 - [ ] **Step 5: Commit**
 
@@ -2312,7 +2322,7 @@ The signal goes to the process group, not the process, because `start_new_sessio
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 48 passed in `test_runner.py`, 104 across the suite
+Expected: 49 passed in `test_runner.py`, 117 across the suite
 
 - [ ] **Step 6: Commit**
 
@@ -2786,7 +2796,7 @@ from agybot.runner import (
 - [ ] **Step 5: Run the whole suite**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 133 passed
+Expected: 136 passed
 
 - [ ] **Step 6: Commit**
 
@@ -2927,7 +2937,7 @@ python3 -m venv .venv
 - [ ] **Step 3: Run the full suite one last time**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 133 passed
+Expected: 136 passed
 
 - [ ] **Step 4: Commit**
 
