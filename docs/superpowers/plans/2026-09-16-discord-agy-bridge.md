@@ -787,6 +787,44 @@ def test_flush_does_not_double_close_a_balanced_fence():
     assert c.flush() == ["```python\nprint(1)\n```"]
 
 
+def test_sealed_body_with_open_fence_respects_the_limit():
+    c = Chunker()
+    c.feed("```\n")
+    while len(c.current) < LIMIT - 10:
+        c.feed("abcde")
+    bodies = c.feed("xy") + c.flush()
+    assert all(len(b) <= LIMIT for b in bodies), \
+        [len(b) for b in bodies if len(b) > LIMIT]
+
+
+def test_no_body_exceeds_the_limit_while_a_fence_stays_open():
+    c = Chunker()
+    bodies = c.feed("```python\n")
+    for _ in range(200):
+        bodies += c.feed("x" * 37)
+    bodies += c.flush()
+    assert all(len(b) <= LIMIT for b in bodies), \
+        [len(b) for b in bodies if len(b) > LIMIT]
+
+
+def test_flush_of_a_nearly_full_open_fence_respects_the_limit():
+    c = Chunker()
+    c.feed("```\n")
+    while len(c.current) < LIMIT - 6:
+        c.feed("ab")
+    assert all(len(b) <= LIMIT for b in c.flush())
+
+
+def test_overlong_fence_language_is_dropped_on_reopen():
+    c = Chunker()
+    c.feed("```" + "z" * 40 + "\n")
+    c.feed("y" * (LIMIT - 60))
+    sealed = c.feed("more text here")
+    assert sealed, "this feed should have forced a seal"
+    assert c.current.startswith("```\n")
+    assert all(len(b) <= LIMIT for b in sealed)
+
+
 def test_fresh_chunker_carries_no_fence_state():
     c1 = Chunker()
     c1.feed("```python\nunterminated")
@@ -815,6 +853,10 @@ LIMIT = 1800
 # Headroom kept free in an oversized split so the reopened fence prefix and
 # the closing fence always fit.
 RESERVE = 24
+
+# A reopened fence longer than this drops its language tag rather than
+# truncating it, which also keeps the reopened prefix inside RESERVE.
+MAX_FENCE_LANG = 12
 
 
 @dataclass(frozen=True)
@@ -855,6 +897,24 @@ def fence_state(text: str) -> str | None:
             fence = None
         i = j + 3
     return fence
+
+
+def _close_suffix(body: str) -> str:
+    """The text needed to close this body's open fence, or "" if balanced."""
+    if fence_state(body) is None:
+        return ""
+    return "```" if body.endswith("\n") else "\n```"
+
+
+def sealed_len(body: str) -> int:
+    """Length this body would have once sealed, fence closure included.
+
+    The seal decision uses this rather than len(), so a body that still owes
+    a closing fence reserves room for it instead of overflowing when sealed.
+    Checking at seal time would be too late: by then the body is already
+    at the limit and the closure pushes it past.
+    """
+    return len(body) + len(_close_suffix(body))
 
 
 def _split_oversized(s: str, maxlen: int) -> list[str]:
@@ -903,7 +963,7 @@ class Chunker:
     def feed(self, s: str) -> list[str]:
         sealed: list[str] = []
         for piece in _split_oversized(s, self._limit - RESERVE):
-            if len(self._body) + len(piece) > self._limit:
+            if sealed_len(self._body + piece) > self._limit:
                 sealed.append(self._seal())
             self._body += piece
         return sealed
@@ -919,20 +979,24 @@ class Chunker:
         """Close the current body and start the next, carrying fence state."""
         lang = fence_state(self._body)
         body = self._close_fence(self._body)
-        self._body = "" if lang is None else f"```{lang}\n"
+        if lang is None:
+            self._body = ""
+        else:
+            # An over-long tag is dropped rather than truncated: an unlabelled
+            # block renders better than a mislabelled one.
+            tag = lang if len(lang) <= MAX_FENCE_LANG else ""
+            self._body = f"```{tag}\n"
         return body
 
     @staticmethod
     def _close_fence(body: str) -> str:
-        if fence_state(body) is None:
-            return body
-        return body + ("```" if body.endswith("\n") else "\n```")
+        return body + _close_suffix(body)
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/test_render.py -v`
-Expected: 21 passed
+Expected: 25 passed
 
 - [ ] **Step 5: Commit**
 
@@ -1211,7 +1275,7 @@ Note the `finish` path. `Chunker.flush()` returns at most one body, so the foote
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/test_render.py -v`
-Expected: 34 passed
+Expected: 38 passed
 
 - [ ] **Step 5: Commit**
 
@@ -2615,7 +2679,7 @@ from agybot.runner import (
 - [ ] **Step 5: Run the whole suite**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 124 passed
+Expected: 128 passed
 
 - [ ] **Step 6: Commit**
 
@@ -2756,7 +2820,7 @@ python3 -m venv .venv
 - [ ] **Step 3: Run the full suite one last time**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 124 passed
+Expected: 128 passed
 
 - [ ] **Step 4: Commit**
 
