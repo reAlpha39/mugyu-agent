@@ -2734,7 +2734,7 @@ The spec requires that the bot refuse to boot with a missing `agy`, and that str
 - Produces:
   - `PreflightError(Exception)`
   - `preflight(cfg: Config) -> None`
-  - `sweep_stray_agy(agy_bin: str) -> int` returning the number of signals sent
+  - `sweep_stray_agy(agy_bin: str) -> int` returning 1 if anything was signalled, 0 otherwise (`pkill` reports no count)
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2821,6 +2821,8 @@ def preflight(cfg) -> None:
             f"agy binary not found: {cfg.agy_bin!r}. "
             "Install it or set AGY_BIN."
         )
+    if not path.is_file():
+        raise PreflightError(f"agy binary is not a file: {path}")
     if not os.access(path, os.X_OK):
         raise PreflightError(f"agy binary is not executable: {path}")
 
@@ -2832,6 +2834,9 @@ def preflight(cfg) -> None:
         if not p.is_dir():
             raise PreflightError(
                 f"workspace {name!r} is not a directory: {location}")
+        if not os.access(p, os.R_OK | os.X_OK):
+            raise PreflightError(
+                f"workspace {name!r} is not readable by this user: {location}")
 
 
 def sweep_stray_agy(agy_bin: str) -> int:
@@ -2842,11 +2847,24 @@ def sweep_stray_agy(agy_bin: str) -> int:
     account for interactive agy sessions.
     """
     pattern = f"{Path(agy_bin).name} -p"
-    result = subprocess.run(
-        ["pkill", "-u", str(os.getuid()), "-f", pattern],
-        capture_output=True,
-    )
-    return 1 if result.returncode == 0 else 0
+    try:
+        result = subprocess.run(
+            ["pkill", "-u", str(os.getuid()), "-f", pattern],
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        # A minimal host may not ship procps. Orphans from a previous run
+        # would survive, so this must be visible rather than silent.
+        log.warning("pkill is not installed; cannot sweep stray agy processes")
+        return 0
+
+    if result.returncode == 0:
+        return 1
+    if result.returncode == 1:
+        return 0                      # nothing matched, the normal case
+    log.warning("pkill failed (exit %s): %s", result.returncode,
+                result.stderr.decode("utf-8", "replace").strip())
+    return 0
 ```
 
 - [ ] **Step 4: Wire them into startup**
@@ -2878,7 +2896,7 @@ from agybot.runner import (
 - [ ] **Step 5: Run the whole suite**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 145 passed
+Expected: 150 passed
 
 - [ ] **Step 6: Commit**
 
@@ -3019,7 +3037,7 @@ python3 -m venv .venv
 - [ ] **Step 3: Run the full suite one last time**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 145 passed
+Expected: 150 passed
 
 - [ ] **Step 4: Commit**
 
