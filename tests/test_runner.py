@@ -572,3 +572,55 @@ def test_preflight_rejects_a_workspace_that_is_a_file(tmp_path):
 
 def test_sweep_is_harmless_when_nothing_matches():
     assert sweep_stray_agy("/definitely/not/a/real/binary/name") == 0
+
+
+def test_preflight_rejects_a_directory_as_the_binary(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    notabinary = tmp_path / "notabinary"
+    notabinary.mkdir()
+    with pytest.raises(PreflightError, match="not a file"):
+        preflight(cfg_with(tmp_path, str(notabinary), {"ws": str(ws)}))
+
+
+def test_preflight_rejects_an_unreadable_workspace(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    ws.chmod(0o000)
+    try:
+        with pytest.raises(PreflightError, match="not readable"):
+            preflight(cfg_with(tmp_path, sys.executable, {"ws": str(ws)}))
+    finally:
+        ws.chmod(0o755)
+
+
+def test_sweep_survives_a_missing_pkill(monkeypatch):
+    import subprocess
+
+    def missing(*a, **k):
+        raise FileNotFoundError("pkill")
+
+    monkeypatch.setattr(subprocess, "run", missing)
+    assert sweep_stray_agy("/opt/agy") == 0
+
+
+def test_sweep_reports_nothing_when_pkill_errors(monkeypatch):
+    import subprocess
+
+    class Failed:
+        returncode = 2
+        stderr = b"pkill: bad syntax"
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: Failed())
+    assert sweep_stray_agy("/opt/agy") == 0
+
+
+def test_sweep_reports_one_when_something_matched(monkeypatch):
+    import subprocess
+
+    class Matched:
+        returncode = 0
+        stderr = b""
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: Matched())
+    assert sweep_stray_agy("/opt/agy") == 1

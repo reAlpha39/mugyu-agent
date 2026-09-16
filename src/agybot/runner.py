@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import shutil
 import signal
@@ -12,6 +13,8 @@ from pathlib import Path
 from typing import Mapping
 
 from agybot.render import Meta, Piece, Text, Tool
+
+log = logging.getLogger("agybot.runner")
 
 # An allowlist, not a denylist. A new secret added to the unit file must not
 # silently become readable by the agent.
@@ -291,6 +294,8 @@ class Turn:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(pgid, signal.SIGKILL)
 
+
+
 class PreflightError(Exception):
     """A startup condition that makes the bot unable to do its job."""
 
@@ -304,6 +309,8 @@ def preflight(cfg) -> None:
             f"agy binary not found: {cfg.agy_bin!r}. "
             "Install it or set AGY_BIN."
         )
+    if not path.is_file():
+        raise PreflightError(f"agy binary is not a file: {path}")
     if not os.access(path, os.X_OK):
         raise PreflightError(f"agy binary is not executable: {path}")
 
@@ -315,18 +322,35 @@ def preflight(cfg) -> None:
         if not p.is_dir():
             raise PreflightError(
                 f"workspace {name!r} is not a directory: {location}")
+        if not os.access(p, os.R_OK | os.X_OK):
+            raise PreflightError(
+                f"workspace {name!r} is not readable by this user: {location}")
 
 
 def sweep_stray_agy(agy_bin: str) -> int:
     """Kill agy processes this user left behind after an unclean shutdown.
 
-    The bot is the only thing that should ever run `agy -p` as the service
-    user, so matching on that pattern is safe. Do not use the service
-    account for interactive agy sessions.
+    Returns 1 if anything was signalled, 0 otherwise. The bot is the only
+    thing that should ever run `agy -p` as the service user, so matching on
+    that pattern is safe. Do not use the service account for interactive
+    agy sessions.
     """
     pattern = f"{Path(agy_bin).name} -p"
-    result = subprocess.run(
-        ["pkill", "-u", str(os.getuid()), "-f", pattern],
-        capture_output=True,
-    )
-    return 1 if result.returncode == 0 else 0
+    try:
+        result = subprocess.run(
+            ["pkill", "-u", str(os.getuid()), "-f", pattern],
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        # A minimal host may not ship procps. Orphans from a previous run
+        # would survive, so this must be visible rather than silent.
+        log.warning("pkill is not installed; cannot sweep stray agy processes")
+        return 0
+
+    if result.returncode == 0:
+        return 1
+    if result.returncode == 1:
+        return 0                      # nothing matched, the normal case
+    log.warning("pkill failed (exit %s): %s", result.returncode,
+                result.stderr.decode("utf-8", "replace").strip())
+    return 0
