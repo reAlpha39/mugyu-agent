@@ -1403,7 +1403,18 @@ import pytest
 from agybot.runner import EventAdapter
 from agybot.render import Text, Tool, Meta
 
-FIXTURE = Path(__file__).parent / "fixtures" / "agy_stream_sample.ndjson"
+FIXTURES = Path(__file__).parent / "fixtures"
+FIXTURE = FIXTURES / "agy_stream_sample.ndjson"
+MULTICHUNK = FIXTURES / "agy_stream_multichunk.ndjson"
+
+
+def replay(path: Path) -> list:
+    a = EventAdapter()
+    pieces = []
+    for line in path.read_text().splitlines():
+        if line.strip():
+            pieces += a.feed(json.loads(line))
+    return pieces
 
 
 def init_ev(cid: str = "c-1") -> dict:
@@ -1491,11 +1502,7 @@ def test_step_update_without_a_payload_yields_nothing():
 
 
 def test_recorded_stream_produces_a_sane_piece_sequence():
-    a = EventAdapter()
-    pieces = []
-    for line in FIXTURE.read_text().splitlines():
-        if line.strip():
-            pieces += a.feed(json.loads(line))
+    pieces = replay(FIXTURE)
 
     metas = [p for p in pieces if isinstance(p, Meta)]
     assert len(metas) == 1, "exactly one conversation id per turn"
@@ -1506,6 +1513,19 @@ def test_recorded_stream_produces_a_sane_piece_sequence():
     assert tools, "the recorded turn was supposed to use a tool"
     assert all(t.ok is None for t in tools), \
         "every tool in the recorded turn succeeded, so none should be flagged"
+
+
+def test_multichunk_fixture_reassembles_by_concatenation():
+    """The sample fixture cannot tell append from replace: its one
+    text-bearing step emits everything in a single event. This fixture
+    can — step_index 3 arrives as five disjoint deltas."""
+    texts = [p.s for p in replay(MULTICHUNK) if isinstance(p, Text)]
+    assert len(texts) >= 2, "this fixture must exercise multi-chunk text"
+    joined = "".join(texts)
+    assert "Starting the check now." in joined
+    assert joined.rstrip().endswith("hello.")
+    # A replace-instead-of-append adapter would emit only the last chunk.
+    assert len(joined) > len(texts[-1])
 ```
 
 The fixture test asserts properties rather than exact strings, so it stays valid whatever the recorded run happened to say. If it fails, the adapter disagrees with reality and the adapter is wrong, not the fixture.
@@ -1595,7 +1615,7 @@ def _detail(parameters: dict) -> str:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/test_runner.py -v`
-Expected: 30 passed
+Expected: 31 passed
 
 If `test_recorded_stream_produces_a_sane_piece_sequence` fails, the adapter disagrees with the captured stream. Fix the adapter, never the fixture.
 
@@ -1795,7 +1815,7 @@ class Slots:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/test_runner.py -v`
-Expected: 40 passed
+Expected: 41 passed
 
 - [ ] **Step 5: Commit**
 
@@ -2092,7 +2112,7 @@ The signal goes to the process group, not the process, because `start_new_sessio
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 47 passed in `test_runner.py`, 103 across the suite
+Expected: 48 passed in `test_runner.py`, 104 across the suite
 
 - [ ] **Step 6: Commit**
 
@@ -2566,7 +2586,7 @@ from agybot.runner import (
 - [ ] **Step 5: Run the whole suite**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 120 passed
+Expected: 121 passed
 
 - [ ] **Step 6: Commit**
 
@@ -2707,7 +2727,7 @@ python3 -m venv .venv
 - [ ] **Step 3: Run the full suite one last time**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 120 passed
+Expected: 121 passed
 
 - [ ] **Step 4: Commit**
 
