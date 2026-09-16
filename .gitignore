@@ -7,3 +7,4 @@ config.toml
 *.db-shm
 .superpowers/
 *.egg-info/
+.env.local

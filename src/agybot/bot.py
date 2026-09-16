@@ -70,8 +70,41 @@ class AgyBot(discord.Client):
 
     async def on_ready(self) -> None:
         log.info("connected as %s", self.user)
+        # Report whether each configured channel is actually reachable. A
+        # mistyped or unshared channel id otherwise shows up only as the bot
+        # silently ignoring every mention.
+        for cid in sorted(self.cfg.channels):
+            channel = self.get_channel(int(cid))
+            if channel is None:
+                log.warning("configured channel %s is NOT VISIBLE to this bot "
+                            "— check the id, and that the bot is in that "
+                            "server with access to the channel", cid)
+            else:
+                log.info("configured channel %s = #%s in %s", cid,
+                         getattr(channel, "name", "?"),
+                         getattr(getattr(channel, "guild", None), "name", "?"))
+                me = getattr(channel.guild, "me", None)
+                if me is not None:
+                    p = channel.permissions_for(me)
+                    log.info(
+                        "  permissions: view=%s send=%s create_threads=%s "
+                        "send_in_threads=%s react=%s history=%s",
+                        p.view_channel, p.send_messages,
+                        p.create_public_threads, p.send_messages_in_threads,
+                        p.add_reactions, p.read_message_history)
+                    if not p.view_channel:
+                        log.warning("  -> without View Channel this bot never "
+                                    "receives messages from this channel")
 
     async def on_message(self, message: discord.Message) -> None:
+        # Debug level: this fires for every message the bot can see, its own
+        # included. Raise the level to DEBUG when a mention appears to go
+        # unnoticed — it distinguishes "never arrived" from "arrived and was
+        # ignored", which is otherwise invisible.
+        log.debug("message chan=%s author=%s bot=%s thread=%s content=%r",
+                  message.channel.id, message.author.id, message.author.bot,
+                  isinstance(message.channel, discord.Thread),
+                  message.content[:60])
         if message.author.bot or self.user is None:
             return
 
@@ -80,18 +113,25 @@ class AgyBot(discord.Client):
             return
 
         if self.user.mentioned_in(message):
+            log.info("mentioned by %s in channel %s",
+                     message.author.id, message.channel.id)
             await self._on_new_task(message)
 
     async def _on_new_task(self, message: discord.Message) -> None:
         if str(message.channel.id) not in self.cfg.channels:
+            log.info("ignoring mention in channel %s: not in the allowlist %s",
+                     message.channel.id, sorted(self.cfg.channels))
             return
 
         tier = tier_of(self.cfg, str(message.author.id))
         if tier == "stranger":
+            log.info("refusing %s: not in the allowlist", message.author.id)
             await message.add_reaction("🚫")
             return
 
         parsed = parse_mention(message.content, str(self.user.id))
+        log.info("accepted %s turn from %s: workspace=%s prompt=%r",
+                 tier, message.author.id, parsed.workspace, parsed.prompt[:80])
         if not parsed.prompt:
             await message.reply("Give me something to do.")
             return
