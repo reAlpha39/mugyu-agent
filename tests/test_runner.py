@@ -1,11 +1,14 @@
 import asyncio
 import json
+import os
+import sys
+import time
 from pathlib import Path
 
 import pytest
 
-from agybot.runner import EventAdapter, Slots, build_argv, minimal_env
-from agybot.render import Meta, Text, Tool
+from agybot.runner import EventAdapter, Slots, Turn, build_argv, minimal_env
+from agybot.render import Meta, Sink, Text, Tool
 
 
 def argv(**kw):
@@ -353,3 +356,84 @@ async def test_release_below_zero_is_refused():
     s = Slots()
     with pytest.raises(RuntimeError):
         s.release()
+
+
+FAKE = str(Path(__file__).parent / "fake_agy.py")
+
+
+class RecordingChannel:
+    def __init__(self):
+        self.messages: list[str] = []
+
+    async def send(self, content: str) -> int:
+        self.messages.append(content)
+        return len(self.messages) - 1
+
+    async def edit(self, handle: int, content: str) -> None:
+        self.messages[handle] = content
+
+
+def turn_for(mode: str, tmp_path, wall_timeout: float = 960, **env_extra):
+    ch = RecordingChannel()
+    sink = Sink(ch.send, ch.edit, interval=0.01)
+    env = {"FAKE_AGY_MODE": mode, "PATH": os.environ["PATH"], **env_extra}
+    t = Turn([sys.executable, FAKE], cwd=str(tmp_path), env=env,
+             sink=sink, wall_timeout=wall_timeout)
+    return t, sink, ch
+
+
+async def test_successful_turn_exits_zero(tmp_path):
+    t, _, _ = turn_for("normal", tmp_path)
+    assert await t.run() == 0
+
+
+async def test_successful_turn_captures_the_conversation_id(tmp_path):
+    t, sink, _ = turn_for("normal", tmp_path)
+    await t.run()
+    assert sink.conversation_id == "c-fake"
+
+
+async def test_successful_turn_renders_text_and_tools(tmp_path):
+    t, _, ch = turn_for("normal", tmp_path)
+    await t.run()
+    whole = "\n".join(ch.messages)
+    assert "the word is banana" in whole
+    assert "🔧 view_file · probe.txt" in whole
+    assert "-# ✅" in whole
+
+
+async def test_failing_turn_reports_stderr(tmp_path):
+    t, _, ch = turn_for("fail", tmp_path)
+    assert await t.run() == 1
+    whole = "\n".join(ch.messages)
+    assert "-# ❌ exit 1" in whole
+    assert "not authenticated with Antigravity" in whole
+
+
+async def test_cancel_stops_the_turn_promptly(tmp_path):
+    t, _, ch = turn_for("slow", tmp_path)
+    task = asyncio.create_task(t.run())
+    await asyncio.sleep(0.5)
+    started = time.monotonic()
+    await t.cancel()
+    await asyncio.wait_for(task, 10)
+    assert time.monotonic() - started < 8
+    assert t.cancelled
+    assert "-# 🛑 cancelled" in "\n".join(ch.messages)
+
+
+async def test_cancel_kills_the_whole_process_group(tmp_path):
+    marker = tmp_path / "grandchild.txt"
+    t, _, _ = turn_for("spawnchild", tmp_path, FAKE_AGY_MARKER=str(marker))
+    task = asyncio.create_task(t.run())
+    await asyncio.sleep(0.5)
+    await t.cancel()
+    await asyncio.wait_for(task, 10)
+    await asyncio.sleep(3.5)
+    assert not marker.exists(), "a grandchild outlived the cancelled turn"
+
+
+async def test_wall_timeout_kills_a_wedged_turn(tmp_path):
+    t, _, ch = turn_for("slow", tmp_path, wall_timeout=0.5)
+    assert await asyncio.wait_for(t.run(), 10) != 0
+    assert "-# 🛑 cancelled" in "\n".join(ch.messages)

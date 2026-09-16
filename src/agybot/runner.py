@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
+import os
+import signal
 from typing import Mapping
 
 from agybot.render import Meta, Piece, Text, Tool
@@ -173,3 +177,86 @@ class Slots:
                 self._cond.notify_all()
 
         asyncio.get_running_loop().create_task(wake())
+
+
+WALL_TIMEOUT = 960.0          # 16 minutes, backstop for --print-timeout 15m
+KILL_GRACE = 5.0
+STDERR_KEEP = 4096
+
+
+class Turn:
+    """One agy invocation, streamed into a sink."""
+
+    def __init__(self, argv: list[str], cwd: str, env: dict[str, str],
+                 sink, adapter: "EventAdapter | None" = None,
+                 wall_timeout: float = WALL_TIMEOUT) -> None:
+        self._argv = argv
+        self._cwd = cwd
+        self._env = env
+        self._sink = sink
+        self._adapter = adapter or EventAdapter()
+        self._wall_timeout = wall_timeout
+        self._proc: asyncio.subprocess.Process | None = None
+        self.cancelled = False
+
+    async def run(self) -> int:
+        await self._sink.start()
+        self._proc = await asyncio.create_subprocess_exec(
+            *self._argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=self._cwd,
+            env=self._env,
+            start_new_session=True,
+        )
+
+        stderr_task = asyncio.create_task(self._proc.stderr.read())
+        watchdog = asyncio.create_task(self._watchdog())
+        try:
+            async for raw in self._proc.stdout:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue            # non-JSON noise on stdout is ignored
+                for piece in self._adapter.feed(ev):
+                    await self._sink.feed(piece)
+
+            returncode = await self._proc.wait()
+        finally:
+            watchdog.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watchdog
+
+        stderr = (await stderr_task).decode("utf-8", "replace")
+        await self._sink.finish(returncode, stderr[-STDERR_KEEP:],
+                                cancelled=self.cancelled)
+        return returncode
+
+    async def cancel(self) -> None:
+        self.cancelled = True
+        await self._kill()
+
+    async def _watchdog(self) -> None:
+        await asyncio.sleep(self._wall_timeout)
+        self.cancelled = True
+        await self._kill()
+
+    async def _kill(self) -> None:
+        proc = self._proc
+        if proc is None or proc.returncode is not None:
+            return
+        try:
+            pgid = os.getpgid(proc.pid)
+        except ProcessLookupError:
+            return
+
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(pgid, signal.SIGTERM)
+        try:
+            await asyncio.wait_for(proc.wait(), KILL_GRACE)
+        except asyncio.TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(pgid, signal.SIGKILL)
