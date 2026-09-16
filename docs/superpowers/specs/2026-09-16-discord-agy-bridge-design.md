@@ -53,7 +53,7 @@ Discord gateway (websocket)
         │
     bot.py ──── config.py   env, workspace allowlist, tier lookup
         │
-        ├──── state.py      sqlite: thread_id → cascade_id, workspace
+        ├──── state.py      sqlite: thread_id → conversation_id, workspace
         │
         ├──── runner.py     subprocess, NDJSON parsing, slots, cancellation
         │
@@ -93,7 +93,7 @@ bliss-app = "/srv/agy/bliss-app"
 ```sql
 CREATE TABLE IF NOT EXISTS threads (
   thread_id   TEXT PRIMARY KEY,
-  cascade_id  TEXT,
+  conversation_id  TEXT,
   workspace   TEXT NOT NULL,
   created_by  TEXT NOT NULL,
   created_at  INTEGER NOT NULL,
@@ -101,7 +101,7 @@ CREATE TABLE IF NOT EXISTS threads (
 );
 ```
 
-`cascade_id` is null until the first turn reports it. The database uses WAL mode. A single process owns it, so there is no lock contention to design around.
+`conversation_id` is null until the first turn reports it. The database uses WAL mode. A single process owns it, so there is no lock contention to design around.
 
 ## Message lifecycle
 
@@ -111,7 +111,7 @@ CREATE TABLE IF NOT EXISTS threads (
 2. The bot resolves the author's tier. An author who is neither the owner nor a member gets a 🚫 reaction and nothing else — no reply, no process.
 3. The bot parses the optional `[name]` prefix and resolves it against `[workspaces]`. An absent prefix selects `default_workspace`. A prefix that names an unlisted workspace produces a reply listing the allowed names, and the turn stops. Raw filesystem paths from chat are never accepted.
 4. The bot creates a thread named from the first 60 characters of the prompt.
-5. The bot inserts a `threads` row with a null `cascade_id`.
+5. The bot inserts a `threads` row with a null `conversation_id`.
 6. The bot spawns `agy` and streams output into the thread.
 7. The first conversation identifier observed in the stream is written to the row.
 
@@ -128,8 +128,8 @@ argv = [
     "--add-dir", workspace,
     "--print-timeout", "15m",
 ]
-if cascade_id:
-    argv += ["--conversation", cascade_id]
+if conversation_id:
+    argv += ["--conversation", conversation_id]
 argv += (["--dangerously-skip-permissions"] if tier == "owner"
          else ["--mode", "plan", "--sandbox"])
 ```
@@ -163,9 +163,14 @@ Because the child runs in its own session, it outlives the bot. The bot is the o
 
 | Piece | Source | Rendering |
 |---|---|---|
-| `Text(str)` | Assistant text delta | Appended to the message buffer |
-| `Tool(name, detail, ok)` | Tool start or result | A subtext line, e.g. `-# 🔧 read · auth.py` |
-| `Meta(cascade_id)` | Init or system event | Written to sqlite, never displayed |
+| `Text(str)` | `step_update` with `step_type: "agent_response"`, from `text_delta` | Appended to the message buffer |
+| `Tool(name, detail, ok)` | `step_update` with `step_type: "tool"`, from `tool_name` and `tool_info.parameters` | A subtext line, e.g. `-# 🔧 view_file · auth.py` |
+| `Meta(conversation_id)` | `init` event, from top-level `conversation_id` | Written to sqlite, never displayed |
+
+Assistant text arrives as incremental deltas, not cumulative snapshots, and a
+step may carry no text at all. Tool calls are announced when their
+`step_update` reports `state: "ACTIVE"` and are silent on `"DONE"`, so each
+call renders once.
 
 Conversation continuity is therefore one stored string. Antigravity holds the history; the bot holds the identifier.
 
@@ -195,7 +200,7 @@ One writer task per turn sleeps 1.5 seconds and edits the current message if the
 
 ### Turn boundaries
 
-A thread opens with a `🤔` placeholder, replaced in place by the first text delta. On completion, a subtext footer is appended to the final message: `-# ✅ 1m22s · 3 tools · cascade a1b2c3`. On failure the footer reads `-# ❌ exit 1` and the last 300 characters of stderr follow in a code block.
+A thread opens with a `🤔` placeholder, replaced in place by the first text delta. On completion, a subtext footer is appended to the final message: `-# ✅ 1m22s · 3 tools · conv a1b2c3`. On failure the footer reads `-# ❌ exit 1` and the last 300 characters of stderr follow in a code block.
 
 ## Concurrency
 
@@ -217,8 +222,8 @@ A ❌ reaction on the bot's message, or `!stop` posted in the thread, cancels th
 | `agy` not authenticated | Detected on stderr; the bot posts setup instructions and does not retry |
 | `agy` exits non-zero | Failure footer plus the last 300 characters of stderr in a code block |
 | Discord disconnects mid-turn | `discord.py` reconnects; the turn continues, output buffers and flushes on reconnect |
-| Bot killed mid-turn | `agy` survives as an orphan, since it runs in its own session. A startup sweep kills stray `agy -p` processes owned by the bot user before the gateway connects. The half-written message keeps no footer; the thread resumes normally by `cascade_id` on the next message |
-| Thread row exists with a null `cascade_id` | Treated as a new conversation |
+| Bot killed mid-turn | `agy` survives as an orphan, since it runs in its own session. A startup sweep kills stray `agy -p` processes owned by the bot user before the gateway connects. The half-written message keeps no footer; the thread resumes normally by `conversation_id` on the next message |
+| Thread row exists with a null `conversation_id` | Treated as a new conversation |
 | Thread archived | Discord unarchives it on post; the row is untouched |
 | Message in a thread the bot did not create | Ignored |
 
@@ -252,4 +257,4 @@ Three questions must be answered before implementation begins. The first two can
 
 1. **A Linux `agy` binary must exist.** The binary on the development Mac is Mach-O arm64. If Antigravity ships no Linux build, this design is unbuildable and the project falls back to driving the Gemini API directly, which is a different system.
 2. **`agy` must authenticate on a headless machine.** The login is a Google account flow. If no device-code path exists, the fallback is copying an authenticated configuration directory from an interactive machine, which must be confirmed to work.
-3. **The `stream-json` event schema must be pinned by observation.** The binary references `cascade_id` and the keys `type`, `subtype`, and `event`, but the field layout is not readable from the binary. One real run of `agy -p --output-format stream-json` resolves it, and also settles whether the prompt is a positional argument or a flag value. No code is written against a guessed schema.
+3. ~~**The `stream-json` event schema must be pinned by observation.**~~ **Resolved.** A real run against the binary produced `docs/agy-stream-schema.md` and `tests/fixtures/agy_stream_sample.ndjson`. The observed schema differs from what this document originally assumed: the top-level discriminator is `event` with values `init`, `step_update`, and `result`, there is no `subtype`, the conversation identifier is `conversation_id` rather than `conversation_id`, and assistant text arrives as incremental `text_delta` values under `step_update`. The sections below have been corrected to match. The prompt is positional: `agy -p "<prompt>"`.

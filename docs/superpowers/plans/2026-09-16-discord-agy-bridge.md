@@ -4,7 +4,7 @@
 
 **Goal:** Build a Discord bot that turns a Discord thread into an Antigravity conversation, driving the local `agy` CLI and streaming its output back into the thread.
 
-**Architecture:** One Python process managed by systemd. Discord messages spawn `agy -p --output-format stream-json` subprocesses, one per turn. A thread's conversation is resumed by storing the `cascade_id` in sqlite and replaying it as `--conversation`. Agent output streams into a live-edited Discord message, chunked at 1800 characters.
+**Architecture:** One Python process managed by systemd. Discord messages spawn `agy -p --output-format stream-json` subprocesses, one per turn. A thread's conversation is resumed by storing the `conversation_id` in sqlite and replaying it as `--conversation`. Agent output streams into a live-edited Discord message, chunked at 1800 characters.
 
 **Tech Stack:** Python 3.11+, `discord.py` 2.x, stdlib `asyncio`, `sqlite3`, `tomllib`. `pytest` and `pytest-asyncio` for tests. No other runtime dependencies.
 
@@ -23,6 +23,8 @@
 - Error reporting: last **300** characters of stderr, in a code block.
 - sqlite runs in **WAL** mode.
 - Subprocesses are spawned with `create_subprocess_exec` (never a shell), `start_new_session=True`, and an environment that excludes `DISCORD_TOKEN`.
+- The `agy` event schema is pinned by observation in `docs/agy-stream-schema.md`. Binding facts: the top-level discriminator is **`event`** with values `init`, `step_update`, `result`; there is no `subtype`; the conversation id is top-level **`conversation_id`** on the `init` event; assistant text is an **incremental** `step_update.text_delta` that is often absent; tool calls are `step_update.step_type == "tool"` with `state` `"ACTIVE"` then `"DONE"`, named by `step_update.tool_name`, with arguments under `step_update.tool_info.parameters`. Tool **failure** signalling was never observed and must not be guessed.
+- The prompt is passed positionally: `agy -p "<prompt>"`.
 - Workspaces are resolved from the config allowlist only. A filesystem path supplied in chat is never accepted.
 - Tier is determined by the author of each individual message, not by the thread creator.
 
@@ -111,7 +113,7 @@ jq -s '.[0]' /tmp/agy-probe/capture.ndjson
 
 Write `docs/agy-stream-schema.md` answering exactly these five questions. Each answer must name a concrete JSON path, not a description:
 
-1. Which event carries the conversation identifier, and at what JSON path? (Expected to be an init or system event carrying something like `cascade_id`.)
+1. Which event carries the conversation identifier, and at what JSON path? (Expected to be an init or system event carrying something like `conversation_id`.)
 2. Which event carries assistant text, at what path, and is it a cumulative snapshot or an incremental delta? This determines whether the adapter appends or diffs.
 3. Which event signals a tool starting, and where is the tool name?
 4. Which event signals a tool finishing, and where is its success or failure indicated?
@@ -423,8 +425,8 @@ git commit -m "feat: add project skeleton and configuration loading"
 **Interfaces:**
 - Consumes: nothing.
 - Produces:
-  - `ThreadRow` frozen dataclass with fields `thread_id: str`, `cascade_id: str | None`, `workspace: str`, `created_by: str`, `created_at: int`, `last_used_at: int`
-  - `Store(path: str)` with methods `create_thread(thread_id: str, workspace: str, created_by: str) -> ThreadRow`, `get_thread(thread_id: str) -> ThreadRow | None`, `set_cascade(thread_id: str, cascade_id: str) -> None`, `touch(thread_id: str) -> None`, `close() -> None`
+  - `ThreadRow` frozen dataclass with fields `thread_id: str`, `conversation_id: str | None`, `workspace: str`, `created_by: str`, `created_at: int`, `last_used_at: int`
+  - `Store(path: str)` with methods `create_thread(thread_id: str, workspace: str, created_by: str) -> ThreadRow`, `get_thread(thread_id: str) -> ThreadRow | None`, `set_conversation(thread_id: str, conversation_id: str) -> None`, `touch(thread_id: str) -> None`, `close() -> None`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -455,15 +457,15 @@ def test_created_thread_round_trips(store):
     assert row.created_by == "u1"
 
 
-def test_cascade_id_starts_null(store):
+def test_conversation_id_starts_null(store):
     store.create_thread("t1", "/srv/agy/app", "u1")
-    assert store.get_thread("t1").cascade_id is None
+    assert store.get_thread("t1").conversation_id is None
 
 
-def test_set_cascade_persists(store):
+def test_set_conversation_persists(store):
     store.create_thread("t1", "/srv/agy/app", "u1")
-    store.set_cascade("t1", "c-abc")
-    assert store.get_thread("t1").cascade_id == "c-abc"
+    store.set_conversation("t1", "c-abc")
+    assert store.get_thread("t1").conversation_id == "c-abc"
 
 
 def test_touch_advances_last_used(store):
@@ -477,11 +479,11 @@ def test_state_survives_reopen(tmp_path):
     path = str(tmp_path / "state.db")
     s1 = Store(path)
     s1.create_thread("t1", "/srv/agy/app", "u1")
-    s1.set_cascade("t1", "c-abc")
+    s1.set_conversation("t1", "c-abc")
     s1.close()
 
     s2 = Store(path)
-    assert s2.get_thread("t1").cascade_id == "c-abc"
+    assert s2.get_thread("t1").conversation_id == "c-abc"
     s2.close()
 
 
@@ -519,7 +521,7 @@ from dataclasses import dataclass
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS threads (
   thread_id    TEXT PRIMARY KEY,
-  cascade_id   TEXT,
+  conversation_id   TEXT,
   workspace    TEXT NOT NULL,
   created_by   TEXT NOT NULL,
   created_at   INTEGER NOT NULL,
@@ -531,7 +533,7 @@ CREATE TABLE IF NOT EXISTS threads (
 @dataclass(frozen=True)
 class ThreadRow:
     thread_id: str
-    cascade_id: str | None
+    conversation_id: str | None
     workspace: str
     created_by: str
     created_at: int
@@ -551,7 +553,7 @@ class Store:
         now = int(time.time())
         self._db.execute(
             "INSERT OR IGNORE INTO threads"
-            " (thread_id, cascade_id, workspace, created_by,"
+            " (thread_id, conversation_id, workspace, created_by,"
             "  created_at, last_used_at)"
             " VALUES (?, NULL, ?, ?, ?, ?)",
             (thread_id, workspace, created_by, now, now),
@@ -568,10 +570,10 @@ class Store:
         r = cur.fetchone()
         return None if r is None else ThreadRow(**dict(r))
 
-    def set_cascade(self, thread_id: str, cascade_id: str) -> None:
+    def set_conversation(self, thread_id: str, conversation_id: str) -> None:
         self._db.execute(
-            "UPDATE threads SET cascade_id = ? WHERE thread_id = ?",
-            (cascade_id, thread_id),
+            "UPDATE threads SET conversation_id = ? WHERE thread_id = ?",
+            (conversation_id, thread_id),
         )
         self._db.commit()
 
@@ -800,7 +802,7 @@ class Tool:
 
 @dataclass(frozen=True)
 class Meta:
-    cascade_id: str
+    conversation_id: str
 
 
 Piece = Text | Tool | Meta
@@ -923,7 +925,7 @@ git commit -m "feat: add 1800-character chunker with code-fence continuation"
 - Produces:
   - `Sink(send, edit, limit=LIMIT, interval=1.5)` where `send` is `async (content: str) -> Any` returning a message handle and `edit` is `async (handle: Any, content: str) -> None`
   - methods `start() -> None`, `feed(piece: Piece) -> None`, `finish(returncode: int, stderr_tail: str = "", cancelled: bool = False) -> None`
-  - attribute `cascade_id: str | None`
+  - attribute `conversation_id: str | None`
   - `fmt_elapsed(seconds: float) -> str`
 
 - [ ] **Step 1: Write the failing tests**
@@ -1004,7 +1006,7 @@ async def test_meta_is_captured_and_not_displayed(ch):
     await s.feed(Meta("c-abc"))
     await s.feed(Text("body"))
     await s.finish(0)
-    assert s.cascade_id == "c-abc"
+    assert s.conversation_id == "c-abc"
     assert "c-abc" in ch.messages[0]      # only via the footer
     assert ch.messages[0].index("body") < ch.messages[0].index("c-abc")
 
@@ -1106,7 +1108,7 @@ class Sink:
         self._writer: asyncio.Task | None = None
         self._started = 0.0
         self._tools = 0
-        self.cascade_id: str | None = None
+        self.conversation_id: str | None = None
 
     async def start(self) -> None:
         self._started = time.monotonic()
@@ -1115,7 +1117,7 @@ class Sink:
 
     async def feed(self, piece: Piece) -> None:
         if isinstance(piece, Meta):
-            self.cascade_id = piece.cascade_id
+            self.conversation_id = piece.conversation_id
             return
 
         if isinstance(piece, Tool):
@@ -1151,14 +1153,14 @@ class Sink:
     def _footer(self, returncode: int, stderr_tail: str,
                 cancelled: bool) -> str:
         elapsed = fmt_elapsed(time.monotonic() - self._started)
-        cid = self.cascade_id or "unknown"
+        cid = self.conversation_id or "unknown"
         if cancelled:
             head = "-# 🛑 cancelled"
         elif returncode == 0:
             head = "-# ✅"
         else:
             head = f"-# ❌ exit {returncode}"
-        out = f"\n{head} · {elapsed} · {self._tools} tools · cascade {cid}"
+        out = f"\n{head} · {elapsed} · {self._tools} tools · conv {cid}"
         if returncode != 0 and stderr_tail:
             out += f"\n```\n{stderr_tail[-STDERR_TAIL:]}\n```"
         return out
@@ -1200,7 +1202,7 @@ git commit -m "feat: add throttled Discord sink with footers and tool subtext"
 **Interfaces:**
 - Consumes: nothing.
 - Produces:
-  - `build_argv(agy_bin: str, prompt: str, workspace: str, cascade_id: str | None, tier: str, timeout: str = "15m") -> list[str]`
+  - `build_argv(agy_bin: str, prompt: str, workspace: str, conversation_id: str | None, tier: str, timeout: str = "15m") -> list[str]`
   - `minimal_env(base: Mapping[str, str]) -> dict[str, str]`
   - `ENV_ALLOWLIST: frozenset[str]`
 
@@ -1214,7 +1216,7 @@ from agybot.runner import build_argv, minimal_env
 
 def argv(**kw):
     base = dict(agy_bin="agy", prompt="do the thing",
-                workspace="/srv/agy/app", cascade_id=None, tier="owner")
+                workspace="/srv/agy/app", conversation_id=None, tier="owner")
     base.update(kw)
     return build_argv(**base)
 
@@ -1266,11 +1268,11 @@ def test_stranger_tier_is_rejected_outright():
 
 
 def test_new_conversation_omits_the_conversation_flag():
-    assert "--conversation" not in argv(cascade_id=None)
+    assert "--conversation" not in argv(conversation_id=None)
 
 
 def test_resumed_conversation_passes_the_id():
-    a = argv(cascade_id="c-abc")
+    a = argv(conversation_id="c-abc")
     assert a[a.index("--conversation") + 1] == "c-abc"
 
 
@@ -1326,7 +1328,7 @@ ENV_ALLOWLIST = frozenset({
 
 
 def build_argv(agy_bin: str, prompt: str, workspace: str,
-               cascade_id: str | None, tier: str,
+               conversation_id: str | None, tier: str,
                timeout: str = "15m") -> list[str]:
     if tier not in ("owner", "member"):
         raise ValueError(f"cannot build a command for tier {tier!r}")
@@ -1337,8 +1339,8 @@ def build_argv(agy_bin: str, prompt: str, workspace: str,
         "--add-dir", workspace,
         "--print-timeout", timeout,
     ]
-    if cascade_id:
-        argv += ["--conversation", cascade_id]
+    if conversation_id:
+        argv += ["--conversation", conversation_id]
     if tier == "owner":
         argv += ["--dangerously-skip-permissions"]
     else:
@@ -1369,7 +1371,7 @@ git commit -m "feat: add agy argv construction and environment scrubbing"
 
 ### Task 7: The event adapter
 
-Write this task against `docs/agy-stream-schema.md` from Task 1. The code below encodes the expected shape; reconcile every JSON path with what the schema document actually records before running the tests.
+Write this task against `docs/agy-stream-schema.md`, produced by Task 1 from a real capture. The schema below is observed fact, not assumption — do not "correct" it back toward anything the CLI help implies.
 
 **Files:**
 - Modify: `src/agybot/runner.py` (append `EventAdapter`)
@@ -1378,6 +1380,17 @@ Write this task against `docs/agy-stream-schema.md` from Task 1. The code below 
 **Interfaces:**
 - Consumes: `Text`, `Tool`, `Meta`, `Piece` from `agybot.render`.
 - Produces: `EventAdapter()` with `feed(ev: dict) -> list[Piece]`
+
+The observed event shapes, for reference while writing:
+
+```
+{"event":"init","conversation_id":"cab28252-...","init":{"cwd":"...","tools":[...]}}
+{"event":"step_update","step_update":{"step_index":0,"state":"DONE","step_type":"user_input"}}
+{"event":"step_update","step_update":{"step_index":3,"state":"ACTIVE","step_type":"agent_response","text_delta":"Starting the check"}}
+{"event":"step_update","step_update":{"step_index":2,"state":"ACTIVE","step_type":"tool","tool_name":"view_file","tool_info":{"name":"view_file","parameters":{"AbsolutePath":"/tmp/agy-probe/probe.txt"}}}}
+{"event":"step_update","step_update":{"step_index":2,"state":"DONE","step_type":"tool","tool_name":"view_file","duration_seconds":0.32,"tool_info":{"parameters":{...},"output":"2 lines, 6 bytes"}}}
+{"event":"result","result":{"status":"SUCCESS","duration_seconds":10.37,"usage":{"total_tokens":30565}}}
+```
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1393,55 +1406,90 @@ from agybot.render import Text, Tool, Meta
 FIXTURE = Path(__file__).parent / "fixtures" / "agy_stream_sample.ndjson"
 
 
+def init_ev(cid: str = "c-1") -> dict:
+    return {"event": "init", "conversation_id": cid,
+            "init": {"cwd": "/tmp", "tools": []}}
+
+
+def step(**kw) -> dict:
+    return {"event": "step_update", "step_update": kw}
+
+
 def test_init_event_yields_the_conversation_id():
+    assert EventAdapter().feed(init_ev()) == [Meta("c-1")]
+
+
+def test_conversation_id_is_emitted_only_once():
     a = EventAdapter()
-    out = a.feed({"type": "system", "subtype": "init", "cascade_id": "c-1"})
-    assert out == [Meta("c-1")]
+    a.feed(init_ev())
+    assert a.feed(init_ev()) == []
 
 
-def test_assistant_text_yields_a_text_piece():
+def test_result_event_yields_nothing():
+    ev = {"event": "result", "result": {"status": "SUCCESS"}}
+    assert EventAdapter().feed(ev) == []
+
+
+def test_user_input_step_yields_nothing():
+    assert EventAdapter().feed(
+        step(step_index=0, state="DONE", step_type="user_input")) == []
+
+
+def test_agent_response_delta_yields_text():
+    assert EventAdapter().feed(
+        step(step_type="agent_response", state="ACTIVE",
+             text_delta="hello")) == [Text("hello")]
+
+
+def test_agent_response_without_text_delta_yields_nothing():
+    assert EventAdapter().feed(
+        step(step_type="agent_response", state="ACTIVE")) == []
+
+
+def test_consecutive_deltas_are_emitted_in_arrival_order():
     a = EventAdapter()
-    a.feed({"type": "system", "subtype": "init", "cascade_id": "c-1"})
-    out = a.feed({"type": "assistant", "text": "hello"})
-    assert out == [Text("hello")]
-
-
-def test_unknown_event_yields_nothing():
-    assert EventAdapter().feed({"type": "something_new"}) == []
-
-
-def test_empty_text_yields_nothing():
-    assert EventAdapter().feed({"type": "assistant", "text": ""}) == []
+    out = (a.feed(step(step_type="agent_response", state="ACTIVE",
+                       text_delta="Star"))
+           + a.feed(step(step_type="agent_response", state="DONE",
+                         text_delta="ted.")))
+    assert out == [Text("Star"), Text("ted.")]
 
 
 def test_tool_start_yields_a_pending_tool_piece():
-    out = EventAdapter().feed(
-        {"type": "tool_use", "name": "read", "input": {"path": "auth.py"}})
-    assert out == [Tool("read", "auth.py", None)]
+    ev = step(step_type="tool", state="ACTIVE", tool_name="view_file",
+              tool_info={"name": "view_file",
+                         "parameters": {"AbsolutePath": "/tmp/probe.txt"}})
+    assert EventAdapter().feed(ev) == [Tool("view_file", "/tmp/probe.txt",
+                                            None)]
 
 
-def test_tool_result_marks_failure():
-    a = EventAdapter()
-    a.feed({"type": "tool_use", "name": "bash", "input": {"command": "false"}})
-    out = a.feed({"type": "tool_result", "name": "bash", "is_error": True})
-    assert out == [Tool("bash", "failed", False)]
+def test_tool_done_is_not_rendered_twice():
+    ev = step(step_type="tool", state="DONE", tool_name="view_file",
+              tool_info={"parameters": {"AbsolutePath": "/tmp/probe.txt"},
+                         "output": "2 lines, 6 bytes"})
+    assert EventAdapter().feed(ev) == []
 
 
-def test_successful_tool_result_is_not_rendered_twice():
-    a = EventAdapter()
-    a.feed({"type": "tool_use", "name": "read", "input": {"path": "a.py"}})
-    assert a.feed({"type": "tool_result", "name": "read",
-                   "is_error": False}) == []
+def test_unknown_tool_state_is_surfaced_as_a_failure():
+    ev = step(step_type="tool", state="ERROR", tool_name="run_command",
+              tool_info={"parameters": {"Command": "false"}})
+    assert EventAdapter().feed(ev) == [Tool("run_command", "error", False)]
 
 
-def test_cascade_id_is_emitted_only_once():
-    a = EventAdapter()
-    a.feed({"type": "system", "subtype": "init", "cascade_id": "c-1"})
-    out = a.feed({"type": "system", "subtype": "init", "cascade_id": "c-1"})
-    assert out == []
+def test_tool_without_recognised_parameters_has_an_empty_detail():
+    ev = step(step_type="tool", state="ACTIVE", tool_name="mystery",
+              tool_info={"parameters": {"Weird": "x"}})
+    assert EventAdapter().feed(ev) == [Tool("mystery", "", None)]
 
 
-@pytest.mark.skipif(not FIXTURE.exists(), reason="Task 1 fixture not captured")
+def test_unknown_event_yields_nothing():
+    assert EventAdapter().feed({"event": "something_new"}) == []
+
+
+def test_step_update_without_a_payload_yields_nothing():
+    assert EventAdapter().feed({"event": "step_update"}) == []
+
+
 def test_recorded_stream_produces_a_sane_piece_sequence():
     a = EventAdapter()
     pieces = []
@@ -1451,100 +1499,107 @@ def test_recorded_stream_produces_a_sane_piece_sequence():
 
     metas = [p for p in pieces if isinstance(p, Meta)]
     assert len(metas) == 1, "exactly one conversation id per turn"
-    assert metas[0].cascade_id, "conversation id must not be empty"
+    assert metas[0].conversation_id, "conversation id must not be empty"
     assert any(isinstance(p, Text) and p.s.strip() for p in pieces), \
         "the recorded turn produced no assistant text"
-    assert any(isinstance(p, Tool) for p in pieces), \
-        "the recorded turn was supposed to use a tool"
+    tools = [p for p in pieces if isinstance(p, Tool)]
+    assert tools, "the recorded turn was supposed to use a tool"
+    assert all(t.ok is None for t in tools), \
+        "every tool in the recorded turn succeeded, so none should be flagged"
 ```
 
-The fixture test asserts properties rather than exact strings, so it stays valid whatever the recorded run happened to say. If it fails, the adapter's JSON paths disagree with reality and the adapter is wrong, not the test.
+The fixture test asserts properties rather than exact strings, so it stays valid whatever the recorded run happened to say. If it fails, the adapter disagrees with reality and the adapter is wrong, not the fixture.
+
+Note `test_recorded_stream_produces_a_sane_piece_sequence` expects exactly one `Meta` even though `conversation_id` is echoed on every event in the stream: only the `init` event is a source of `Meta`, and the adapter emits at most one.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `.venv/bin/pytest tests/test_runner.py -v -k "adapter or event or tool_ or cascade or recorded"`
+Run: `.venv/bin/pytest tests/test_runner.py -v -k "adapter or event or tool_ or conversation or recorded or delta or step"`
 Expected: `ImportError: cannot import name 'EventAdapter' from 'agybot.runner'`
 
 - [ ] **Step 3: Write the implementation**
 
-Append to `src/agybot/runner.py`:
+Append to `src/agybot/runner.py`, hoisting the import to the module's import block:
 
 ```python
 from agybot.render import Meta, Piece, Text, Tool
 
-# Keys checked in order when summarising a tool's input for display.
-TOOL_DETAIL_KEYS = ("path", "file_path", "command", "pattern", "query", "url")
+# Parameter keys checked in order when summarising a tool call for display.
+# agy's built-in tools use PascalCase; the lowercase spellings cover MCP and
+# plugin tools that follow other conventions.
+TOOL_DETAIL_KEYS = (
+    "AbsolutePath", "Path", "path", "file_path",
+    "Command", "command", "Query", "query", "url",
+)
 
 
 class EventAdapter:
     """Translates agy stream-json events into render pieces.
 
-    The only component that knows the CLI's event schema. Everything
-    downstream sees Text, Tool, and Meta and nothing else.
+    The only component that knows the CLI's event schema, which is pinned by
+    observation in docs/agy-stream-schema.md. Everything downstream sees
+    Text, Tool, and Meta and nothing else.
     """
 
     def __init__(self) -> None:
-        self._cascade_sent = False
+        self._conversation_sent = False
 
     def feed(self, ev: dict) -> list[Piece]:
-        kind = ev.get("type")
+        kind = ev.get("event")
 
-        if kind == "system" and not self._cascade_sent:
-            cid = ev.get("cascade_id") or ev.get("conversation_id")
-            if cid:
-                self._cascade_sent = True
+        if kind == "init":
+            cid = ev.get("conversation_id")
+            if cid and not self._conversation_sent:
+                self._conversation_sent = True
                 return [Meta(str(cid))]
             return []
 
-        if kind == "assistant":
-            text = ev.get("text") or ""
-            return [Text(text)] if text else []
+        if kind == "step_update":
+            return self._step(ev.get("step_update") or {})
 
-        if kind == "tool_use":
-            return [Tool(str(ev.get("name", "tool")),
-                         _detail(ev.get("input") or {}), None)]
+        return []
 
-        if kind == "tool_result":
-            if ev.get("is_error"):
-                return [Tool(str(ev.get("name", "tool")), "failed", False)]
-            return []
+    def _step(self, su: dict) -> list[Piece]:
+        step_type = su.get("step_type")
+
+        if step_type == "agent_response":
+            # text_delta is incremental and frequently absent; emitting each
+            # delta in arrival order reconstructs the response exactly.
+            delta = su.get("text_delta") or ""
+            return [Text(delta)] if delta else []
+
+        if step_type == "tool":
+            state = su.get("state")
+            name = str(su.get("tool_name") or "tool")
+            info = su.get("tool_info") or {}
+            detail = _detail(info.get("parameters") or {})
+            if state == "ACTIVE":
+                return [Tool(name, detail, None)]
+            if state == "DONE":
+                return []           # already announced when it started
+            # Tool failure was never observed during the schema probe, so any
+            # state that is neither ACTIVE nor DONE is surfaced rather than
+            # silently dropped. See docs/agy-stream-schema.md, question 4.
+            return [Tool(name, str(state).lower(), False)]
 
         return []
 
 
-def _detail(payload: dict) -> str:
+def _detail(parameters: dict) -> str:
     for key in TOOL_DETAIL_KEYS:
-        if payload.get(key):
-            return str(payload[key])[:80]
+        if parameters.get(key):
+            return str(parameters[key])[:80]
     return ""
 ```
 
-- [ ] **Step 4: Reconcile against the observed schema**
-
-Open `docs/agy-stream-schema.md` and check each of the five answers against the code:
-
-- If the conversation id lives at a nested path such as `session.cascade_id`, change the lookup in the `system` branch.
-- If assistant text is a **cumulative snapshot** rather than an incremental delta, the adapter must diff. Add `self._emitted = 0` to `__init__` and replace the `assistant` branch with:
-
-```python
-        if kind == "assistant":
-            full = ev.get("text") or ""
-            delta = full[self._emitted:]
-            self._emitted = len(full)
-            return [Text(delta)] if delta else []
-```
-
-- If tool start and result use different `type` values than `tool_use` and `tool_result`, rename the two branches.
-- If failure is signalled by a field other than `is_error`, change that check.
-
-- [ ] **Step 5: Run the tests to verify they pass**
+- [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/test_runner.py -v`
-Expected: 25 passed
+Expected: 30 passed
 
 If `test_recorded_stream_produces_a_sane_piece_sequence` fails, the adapter disagrees with the captured stream. Fix the adapter, never the fixture.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add src/agybot/runner.py tests/test_runner.py
@@ -1740,7 +1795,7 @@ class Slots:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/test_runner.py -v`
-Expected: 35 passed
+Expected: 40 passed
 
 - [ ] **Step 5: Commit**
 
@@ -1779,9 +1834,17 @@ import sys
 import time
 
 
+CID = "c-fake"
+
+
 def emit(obj) -> None:
     sys.stdout.write(json.dumps(obj) + "\n")
     sys.stdout.flush()
+
+
+def step(**kw) -> None:
+    emit({"event": "step_update",
+          "step_update": {"conversation_id": CID, **kw}})
 
 
 mode = os.environ.get("FAKE_AGY_MODE", "normal")
@@ -1790,7 +1853,9 @@ if mode == "fail":
     sys.stderr.write("fatal: not authenticated with Antigravity\n")
     sys.exit(1)
 
-emit({"type": "system", "subtype": "init", "cascade_id": "c-fake"})
+emit({"event": "init", "conversation_id": CID,
+      "init": {"cwd": os.getcwd(), "tools": ["view_file"]}})
+step(step_index=0, state="DONE", step_type="user_input")
 
 if mode in ("slow", "spawnchild"):
     if mode == "spawnchild":
@@ -1801,12 +1866,28 @@ if mode in ("slow", "spawnchild"):
             "pathlib.Path(sys.argv[1]).write_text('alive')",
             marker,
         ])
-    emit({"type": "assistant", "text": "starting"})
+    step(step_index=1, state="ACTIVE", step_type="agent_response",
+         text_delta="starting")
     time.sleep(30)
 
-emit({"type": "tool_use", "name": "read", "input": {"path": "probe.txt"}})
-emit({"type": "assistant", "text": "the word is banana"})
-emit({"type": "result", "subtype": "success"})
+params = {"AbsolutePath": "probe.txt"}
+step(step_index=2, state="ACTIVE", step_type="tool", tool_name="view_file",
+     tool_info={"name": "view_file", "parameters": params})
+step(step_index=2, state="DONE", step_type="tool", tool_name="view_file",
+     duration_seconds=0.3,
+     tool_info={"name": "view_file", "parameters": params,
+                "output": "1 line, 7 bytes"})
+
+# Split across two deltas so the test exercises incremental reassembly.
+step(step_index=3, state="ACTIVE", step_type="agent_response",
+     text_delta="the word is ")
+step(step_index=3, state="DONE", step_type="agent_response",
+     text_delta="banana")
+
+emit({"event": "result",
+      "result": {"conversation_id": CID, "status": "SUCCESS",
+                 "duration_seconds": 0.5, "num_turns": 1,
+                 "usage": {"total_tokens": 42}}})
 ```
 
 ```bash
@@ -1857,7 +1938,7 @@ async def test_successful_turn_exits_zero(tmp_path):
 async def test_successful_turn_captures_the_conversation_id(tmp_path):
     t, sink, _ = turn_for("normal", tmp_path)
     await t.run()
-    assert sink.cascade_id == "c-fake"
+    assert sink.conversation_id == "c-fake"
 
 
 async def test_successful_turn_renders_text_and_tools(tmp_path):
@@ -1865,7 +1946,7 @@ async def test_successful_turn_renders_text_and_tools(tmp_path):
     await t.run()
     whole = "\n".join(ch.messages)
     assert "the word is banana" in whole
-    assert "🔧 read · probe.txt" in whole
+    assert "🔧 view_file · probe.txt" in whole
     assert "-# ✅" in whole
 
 
@@ -2011,7 +2092,7 @@ The signal goes to the process group, not the process, because `start_new_sessio
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 42 passed in `test_runner.py`, 98 across the suite
+Expected: 47 passed in `test_runner.py`, 103 across the suite
 
 - [ ] **Step 6: Commit**
 
@@ -2261,7 +2342,7 @@ class AgyBot(discord.Client):
                 sink = Sink(send, edit)
                 turn = Turn(
                     argv=build_argv(self.cfg.agy_bin, prompt, row.workspace,
-                                    row.cascade_id, tier),
+                                    row.conversation_id, tier),
                     cwd=row.workspace,
                     env=minimal_env(os.environ),
                     sink=sink,
@@ -2275,8 +2356,8 @@ class AgyBot(discord.Client):
                     self.turns.pop(thread.id, None)
                     self.owners.pop(thread.id, None)
 
-                if sink.cascade_id and not row.cascade_id:
-                    self.store.set_cascade(str(thread.id), sink.cascade_id)
+                if sink.conversation_id and not row.conversation_id:
+                    self.store.set_conversation(str(thread.id), sink.conversation_id)
                 self.store.touch(str(thread.id))
             finally:
                 self.slots.release()
@@ -2485,7 +2566,7 @@ from agybot.runner import (
 - [ ] **Step 5: Run the whole suite**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 115 passed
+Expected: 120 passed
 
 - [ ] **Step 6: Commit**
 
@@ -2626,7 +2707,7 @@ python3 -m venv .venv
 - [ ] **Step 3: Run the full suite one last time**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 115 passed
+Expected: 120 passed
 
 - [ ] **Step 4: Commit**
 
