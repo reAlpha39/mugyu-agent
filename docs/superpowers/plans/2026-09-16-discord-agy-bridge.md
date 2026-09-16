@@ -1691,10 +1691,38 @@ def test_tool_done_is_not_rendered_twice():
     assert EventAdapter().feed(ev) == []
 
 
-def test_unknown_tool_state_is_surfaced_as_a_failure():
-    ev = step(step_type="tool", state="ERROR", tool_name="run_command",
-              tool_info={"parameters": {"Command": "false"}})
-    assert EventAdapter().feed(ev) == [Tool("run_command", "error", False)]
+def test_unknown_tool_state_renders_nothing():
+    ev = step(step_type="tool", state="PENDING", tool_name="x",
+              tool_info={"parameters": {}})
+    assert EventAdapter().feed(ev) == []
+
+
+def test_a_non_dict_event_is_ignored():
+    a = EventAdapter()
+    for junk in ("a string", ["a", "list"], 42, None):
+        assert a.feed(junk) == []
+
+
+def test_a_non_dict_step_update_is_ignored():
+    assert EventAdapter().feed(
+        {"event": "step_update", "step_update": "oops"}) == []
+
+
+def test_a_non_dict_tool_info_does_not_crash():
+    ev = step(step_type="tool", state="ACTIVE", tool_name="x",
+              tool_info="oops")
+    assert EventAdapter().feed(ev) == [Tool("x", "", None)]
+
+
+def test_non_dict_parameters_do_not_crash():
+    ev = step(step_type="tool", state="ACTIVE", tool_name="x",
+              tool_info={"parameters": ["a", "b"]})
+    assert EventAdapter().feed(ev) == [Tool("x", "", None)]
+
+
+def test_a_non_string_text_delta_is_ignored():
+    assert EventAdapter().feed(
+        step(step_type="agent_response", state="ACTIVE", text_delta=42)) == []
 
 
 def test_tool_without_recognised_parameters_has_an_empty_detail():
@@ -1725,17 +1753,19 @@ def test_recorded_stream_produces_a_sane_piece_sequence():
         "every tool in the recorded turn succeeded, so none should be flagged"
 
 
-def test_multichunk_fixture_reassembles_by_concatenation():
-    """The sample fixture cannot tell append from replace: its one
-    text-bearing step emits everything in a single event. This fixture
-    can — step_index 3 arrives as five disjoint deltas."""
+def test_multichunk_fixture_reassembles_exactly():
+    """The sample fixture cannot tell append from replace: its one text-bearing
+    step emits everything in a single event. This fixture can — step_index 3
+    arrives as five disjoint deltas whose concatenation equals the turn's
+    result.response, so the assertion is exact rather than a containment check
+    that duplication could also satisfy."""
+    events = [json.loads(line) for line in MULTICHUNK.read_text().splitlines()
+              if line.strip()]
+    expected = next(e["result"]["response"] for e in events
+                    if e.get("event") == "result")
     texts = [p.s for p in replay(MULTICHUNK) if isinstance(p, Text)]
     assert len(texts) >= 2, "this fixture must exercise multi-chunk text"
-    joined = "".join(texts)
-    assert "Starting the check now." in joined
-    assert joined.rstrip().endswith("hello.")
-    # A replace-instead-of-append adapter would emit only the last chunk.
-    assert len(joined) > len(texts[-1])
+    assert "".join(texts) == expected
 ```
 
 The fixture test asserts properties rather than exact strings, so it stays valid whatever the recorded run happened to say. If it fails, the adapter disagrees with reality and the adapter is wrong, not the fixture.
@@ -1774,7 +1804,13 @@ class EventAdapter:
     def __init__(self) -> None:
         self._conversation_sent = False
 
-    def feed(self, ev: dict) -> list[Piece]:
+    def feed(self, ev: object) -> list[Piece]:
+        # Runs per line of a live subprocess stream, so it must never raise:
+        # an exception here aborts the user's turn mid-answer. Every field is
+        # type-checked rather than merely presence-checked.
+        if not isinstance(ev, dict):
+            return []
+
         kind = ev.get("event")
 
         if kind == "init":
@@ -1785,7 +1821,8 @@ class EventAdapter:
             return []
 
         if kind == "step_update":
-            return self._step(ev.get("step_update") or {})
+            su = ev.get("step_update")
+            return self._step(su) if isinstance(su, dict) else []
 
         return []
 
@@ -1795,22 +1832,24 @@ class EventAdapter:
         if step_type == "agent_response":
             # text_delta is incremental and frequently absent; emitting each
             # delta in arrival order reconstructs the response exactly.
-            delta = su.get("text_delta") or ""
-            return [Text(delta)] if delta else []
+            delta = su.get("text_delta")
+            return [Text(delta)] if isinstance(delta, str) and delta else []
 
         if step_type == "tool":
             state = su.get("state")
-            name = str(su.get("tool_name") or "tool")
-            info = su.get("tool_info") or {}
-            detail = _detail(info.get("parameters") or {})
             if state == "ACTIVE":
+                name = str(su.get("tool_name") or "tool")
+                info = su.get("tool_info")
+                params = info.get("parameters") if isinstance(info, dict) else None
+                detail = _detail(params if isinstance(params, dict) else {})
                 return [Tool(name, detail, None)]
-            if state == "DONE":
-                return []           # already announced when it started
-            # Tool failure was never observed during the schema probe, so any
-            # state that is neither ACTIVE nor DONE is surfaced rather than
-            # silently dropped. See docs/agy-stream-schema.md, question 4.
-            return [Tool(name, str(state).lower(), False)]
+            # DONE renders nothing, because the call was announced when it
+            # started. Any other state renders nothing either: tool failure
+            # signalling was never observed, and docs/agy-stream-schema.md
+            # question 4 says to treat unknown states as unhandled rather than
+            # assume they mean failure. When a real failing tool is captured,
+            # add the branch then.
+            return []
 
         return []
 
@@ -1825,7 +1864,7 @@ def _detail(parameters: dict) -> str:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/test_runner.py -v`
-Expected: 32 passed
+Expected: 37 passed
 
 If `test_recorded_stream_produces_a_sane_piece_sequence` fails, the adapter disagrees with the captured stream. Fix the adapter, never the fixture.
 
@@ -2025,7 +2064,7 @@ class Slots:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/test_runner.py -v`
-Expected: 42 passed
+Expected: 47 passed
 
 - [ ] **Step 5: Commit**
 
@@ -2322,7 +2361,7 @@ The signal goes to the process group, not the process, because `start_new_sessio
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 49 passed in `test_runner.py`, 117 across the suite
+Expected: 54 passed in `test_runner.py`, 122 across the suite
 
 - [ ] **Step 6: Commit**
 
@@ -2796,7 +2835,7 @@ from agybot.runner import (
 - [ ] **Step 5: Run the whole suite**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 136 passed
+Expected: 141 passed
 
 - [ ] **Step 6: Commit**
 
@@ -2937,7 +2976,7 @@ python3 -m venv .venv
 - [ ] **Step 3: Run the full suite one last time**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 136 passed
+Expected: 141 passed
 
 - [ ] **Step 4: Commit**
 
