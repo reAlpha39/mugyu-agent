@@ -139,3 +139,41 @@ def test_fresh_chunker_carries_no_fence_state():
     c2 = Chunker()
     assert c2.feed("plain") == []
     assert fence_state(c2.current) is None
+
+
+def test_sealed_body_with_open_fence_respects_the_limit():
+    c = Chunker()
+    c.feed("```\n")
+    while len(c.current) < LIMIT - 10:
+        c.feed("abcde")
+    bodies = c.feed("xy") + c.flush()
+    assert all(len(b) <= LIMIT for b in bodies), \
+        [len(b) for b in bodies if len(b) > LIMIT]
+
+
+def test_no_body_exceeds_the_limit_while_a_fence_stays_open():
+    c = Chunker()
+    bodies = c.feed("```python\n")
+    for _ in range(200):
+        bodies += c.feed("x" * 37)
+    bodies += c.flush()
+    assert all(len(b) <= LIMIT for b in bodies), \
+        [len(b) for b in bodies if len(b) > LIMIT]
+
+
+def test_flush_of_a_nearly_full_open_fence_respects_the_limit():
+    c = Chunker()
+    c.feed("```\n")
+    while len(c.current) < LIMIT - 6:
+        c.feed("ab")
+    assert all(len(b) <= LIMIT for b in c.flush())
+
+
+def test_overlong_fence_language_is_dropped_on_reopen():
+    c = Chunker()
+    c.feed("```" + "z" * 40 + "\n")
+    c.feed("y" * (LIMIT - 60))
+    sealed = c.feed("more text here")
+    assert sealed, "this feed should have forced a seal"
+    assert c.current.startswith("```\n")
+    assert all(len(b) <= LIMIT for b in sealed)

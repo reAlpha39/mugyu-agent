@@ -9,6 +9,8 @@ LIMIT = 1800
 # the closing fence always fit.
 RESERVE = 24
 
+MAX_FENCE_LANG = 12
+
 
 @dataclass(frozen=True)
 class Text:
@@ -48,6 +50,22 @@ def fence_state(text: str) -> str | None:
             fence = None
         i = j + 3
     return fence
+
+
+def _close_suffix(body: str) -> str:
+    """The text needed to close this body's open fence, or "" if balanced."""
+    if fence_state(body) is None:
+        return ""
+    return "```" if body.endswith("\n") else "\n```"
+
+
+def sealed_len(body: str) -> int:
+    """Length this body would have once sealed, fence closure included.
+
+    The seal decision uses this rather than len(), so a body that still owes
+    a closing fence reserves room for it instead of overflowing when sealed.
+    """
+    return len(body) + len(_close_suffix(body))
 
 
 def _split_oversized(s: str, maxlen: int) -> list[str]:
@@ -96,7 +114,7 @@ class Chunker:
     def feed(self, s: str) -> list[str]:
         sealed: list[str] = []
         for piece in _split_oversized(s, self._limit - RESERVE):
-            if len(self._body) + len(piece) > self._limit:
+            if sealed_len(self._body + piece) > self._limit:
                 sealed.append(self._seal())
             self._body += piece
         return sealed
@@ -112,11 +130,16 @@ class Chunker:
         """Close the current body and start the next, carrying fence state."""
         lang = fence_state(self._body)
         body = self._close_fence(self._body)
-        self._body = "" if lang is None else f"```{lang}\n"
+        if lang is None:
+            self._body = ""
+        else:
+            # An over-long tag is dropped rather than truncated: an unlabelled
+            # block renders better than a mislabelled one, and bounding the
+            # prefix keeps the reopened body inside RESERVE.
+            tag = lang if len(lang) <= MAX_FENCE_LANG else ""
+            self._body = f"```{tag}\n"
         return body
 
     @staticmethod
     def _close_fence(body: str) -> str:
-        if fence_state(body) is None:
-            return body
-        return body + ("```" if body.endswith("\n") else "\n```")
+        return body + _close_suffix(body)
