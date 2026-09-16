@@ -1,0 +1,19 @@
+# Copy to config.toml and fill in. config.toml is gitignored.
+# Discord user and channel ids are strings. Enable Developer Mode in
+# Discord, then right-click a user or channel and choose "Copy ID".
+
+# Full tool access, runs with --dangerously-skip-permissions.
+owner_id = "000000000000000000"
+
+# Restricted to --mode plan --sandbox.
+members = ["111111111111111111"]
+
+# Mentions are honored only in these channels.
+channels = ["222222222222222222"]
+
+# Used when a message names no workspace. Must be a key below.
+default_workspace = "scratch"
+
+# The only directories the bot will ever pass to agy.
+[workspaces]
+scratch = "/srv/agy/scratch"

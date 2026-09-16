@@ -4,7 +4,7 @@
 
 **Goal:** Build a Discord bot that turns a Discord thread into an Antigravity conversation, driving the local `agy` CLI and streaming its output back into the thread.
 
-**Architecture:** One Python process managed by systemd. Discord messages spawn `agy -p --output-format stream-json` subprocesses, one per turn. A thread's conversation is resumed by storing the `cascade_id` in sqlite and replaying it as `--conversation`. Agent output streams into a live-edited Discord message, chunked at 1800 characters.
+**Architecture:** One Python process managed by systemd. Discord messages spawn `agy -p --output-format stream-json` subprocesses, one per turn. A thread's conversation is resumed by storing the `conversation_id` in sqlite and replaying it as `--conversation`. Agent output streams into a live-edited Discord message, chunked at 1800 characters.
 
 **Tech Stack:** Python 3.11+, `discord.py` 2.x, stdlib `asyncio`, `sqlite3`, `tomllib`. `pytest` and `pytest-asyncio` for tests. No other runtime dependencies.
 
@@ -23,6 +23,8 @@
 - Error reporting: last **300** characters of stderr, in a code block.
 - sqlite runs in **WAL** mode.
 - Subprocesses are spawned with `create_subprocess_exec` (never a shell), `start_new_session=True`, and an environment that excludes `DISCORD_TOKEN`.
+- The `agy` event schema is pinned by observation in `docs/agy-stream-schema.md`. Binding facts: the top-level discriminator is **`event`** with values `init`, `step_update`, `result`; there is no `subtype`; the conversation id is top-level **`conversation_id`** on the `init` event; assistant text is an **incremental** `step_update.text_delta` that is often absent; tool calls are `step_update.step_type == "tool"` with `state` `"ACTIVE"` then `"DONE"`, named by `step_update.tool_name`, with arguments under `step_update.tool_info.parameters`. Tool **failure** signalling was never observed and must not be guessed.
+- The prompt is passed positionally: `agy -p "<prompt>"`.
 - Workspaces are resolved from the config allowlist only. A filesystem path supplied in chat is never accepted.
 - Tier is determined by the author of each individual message, not by the thread creator.
 
@@ -111,7 +113,7 @@ jq -s '.[0]' /tmp/agy-probe/capture.ndjson
 
 Write `docs/agy-stream-schema.md` answering exactly these five questions. Each answer must name a concrete JSON path, not a description:
 
-1. Which event carries the conversation identifier, and at what JSON path? (Expected to be an init or system event carrying something like `cascade_id`.)
+1. Which event carries the conversation identifier, and at what JSON path? (Expected to be an init or system event carrying something like `conversation_id`.)
 2. Which event carries assistant text, at what path, and is it a cumulative snapshot or an incremental delta? This determines whether the adapter appends or diffs.
 3. Which event signals a tool starting, and where is the tool name?
 4. Which event signals a tool finishing, and where is its success or failure indicated?
@@ -138,7 +140,7 @@ git commit -m "docs: pin agy stream-json event schema from observed run"
 **Interfaces:**
 - Consumes: nothing.
 - Produces:
-  - `Config` frozen dataclass with fields `owner_id: str`, `members: frozenset[str]`, `channels: frozenset[str]`, `default_workspace: str`, `workspaces: dict[str, str]`, `agy_bin: str`, `token: str`
+  - `Config` frozen dataclass with fields `owner_id: str`, `members: frozenset[str]`, `channels: frozenset[str]`, `default_workspace: str`, `workspaces: Mapping[str, str]` (a read-only `MappingProxyType`), `agy_bin: str`, `token: str` (hidden from `repr`)
   - `load_config(path: Path, env: Mapping[str, str]) -> Config`
   - `tier_of(cfg: Config, user_id: str) -> str` returning `"owner"`, `"member"`, or `"stranger"`
   - `resolve_workspace(cfg: Config, name: str | None) -> str` returning an absolute path
@@ -273,6 +275,23 @@ def test_traversal_attempt_is_refused(cfg):
         resolve_workspace(cfg, "../../etc")
 
 
+def test_token_is_absent_from_the_repr(cfg):
+    assert "tok" not in repr(cfg)
+
+
+def test_workspace_allowlist_cannot_be_mutated(cfg):
+    with pytest.raises(TypeError):
+        cfg.workspaces["evil"] = "/etc"
+
+
+def test_relative_workspace_path_is_refused(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text(CONFIG_TEXT.replace('scratch = "/srv/agy/scratch"',
+                                     'scratch = "relative/path"'))
+    with pytest.raises(ValueError, match="absolute"):
+        load_config(p, {"DISCORD_TOKEN": "tok"})
+
+
 def test_default_workspace_must_exist_in_map(tmp_path: Path):
     p = tmp_path / "config.toml"
     p.write_text(CONFIG_TEXT.replace('default_workspace = "scratch"',
@@ -295,8 +314,9 @@ Expected: collection error, `ModuleNotFoundError: No module named 'agybot.config
 from __future__ import annotations
 
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Mapping
 
 
@@ -315,9 +335,12 @@ class Config:
     members: frozenset[str]
     channels: frozenset[str]
     default_workspace: str
-    workspaces: dict[str, str]
+    workspaces: Mapping[str, str]
     agy_bin: str
-    token: str
+    # field(repr=False) supplies no default, so token stays required and the
+    # argument order is unchanged. It keeps the live bot token out of any
+    # repr(), log line, or crash dump that happens to hold a Config.
+    token: str = field(repr=False)
 
 
 def load_config(path: Path, env: Mapping[str, str]) -> Config:
@@ -332,6 +355,12 @@ def load_config(path: Path, env: Mapping[str, str]) -> Config:
     if not workspaces:
         raise ValueError("config defines no [workspaces]")
 
+    relative = sorted(n for n, p in workspaces.items()
+                      if not Path(p).is_absolute())
+    if relative:
+        raise ValueError(
+            f"workspace paths must be absolute: {', '.join(relative)}")
+
     default_workspace = str(raw["default_workspace"])
     if default_workspace not in workspaces:
         raise ValueError(
@@ -343,7 +372,9 @@ def load_config(path: Path, env: Mapping[str, str]) -> Config:
         members=frozenset(str(m) for m in raw.get("members", [])),
         channels=frozenset(str(c) for c in raw.get("channels", [])),
         default_workspace=default_workspace,
-        workspaces=workspaces,
+        # frozen=True stops rebinding, not mutation. The allowlist is the
+        # access-control boundary, so it is made genuinely read-only here.
+        workspaces=MappingProxyType(workspaces),
         agy_bin=env.get("AGY_BIN", "agy"),
         token=token,
     )
@@ -376,7 +407,7 @@ Note that `resolve_workspace` needs no traversal-stripping logic: a dictionary l
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/test_config.py -v`
-Expected: 14 passed
+Expected: 17 passed
 
 - [ ] **Step 6: Write the configuration template**
 
@@ -423,8 +454,8 @@ git commit -m "feat: add project skeleton and configuration loading"
 **Interfaces:**
 - Consumes: nothing.
 - Produces:
-  - `ThreadRow` frozen dataclass with fields `thread_id: str`, `cascade_id: str | None`, `workspace: str`, `created_by: str`, `created_at: int`, `last_used_at: int`
-  - `Store(path: str)` with methods `create_thread(thread_id: str, workspace: str, created_by: str) -> ThreadRow`, `get_thread(thread_id: str) -> ThreadRow | None`, `set_cascade(thread_id: str, cascade_id: str) -> None`, `touch(thread_id: str) -> None`, `close() -> None`
+  - `ThreadRow` frozen dataclass with fields `thread_id: str`, `conversation_id: str | None`, `workspace: str`, `created_by: str`, `created_at: int`, `last_used_at: int`
+  - `Store(path: str)` with methods `create_thread(thread_id: str, workspace: str, created_by: str) -> ThreadRow`, `get_thread(thread_id: str) -> ThreadRow | None`, `set_conversation(thread_id: str, conversation_id: str) -> None`, `touch(thread_id: str) -> None`, `close() -> None`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -455,15 +486,15 @@ def test_created_thread_round_trips(store):
     assert row.created_by == "u1"
 
 
-def test_cascade_id_starts_null(store):
+def test_conversation_id_starts_null(store):
     store.create_thread("t1", "/srv/agy/app", "u1")
-    assert store.get_thread("t1").cascade_id is None
+    assert store.get_thread("t1").conversation_id is None
 
 
-def test_set_cascade_persists(store):
+def test_set_conversation_persists(store):
     store.create_thread("t1", "/srv/agy/app", "u1")
-    store.set_cascade("t1", "c-abc")
-    assert store.get_thread("t1").cascade_id == "c-abc"
+    store.set_conversation("t1", "c-abc")
+    assert store.get_thread("t1").conversation_id == "c-abc"
 
 
 def test_touch_advances_last_used(store):
@@ -477,11 +508,11 @@ def test_state_survives_reopen(tmp_path):
     path = str(tmp_path / "state.db")
     s1 = Store(path)
     s1.create_thread("t1", "/srv/agy/app", "u1")
-    s1.set_cascade("t1", "c-abc")
+    s1.set_conversation("t1", "c-abc")
     s1.close()
 
     s2 = Store(path)
-    assert s2.get_thread("t1").cascade_id == "c-abc"
+    assert s2.get_thread("t1").conversation_id == "c-abc"
     s2.close()
 
 
@@ -519,7 +550,7 @@ from dataclasses import dataclass
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS threads (
   thread_id    TEXT PRIMARY KEY,
-  cascade_id   TEXT,
+  conversation_id   TEXT,
   workspace    TEXT NOT NULL,
   created_by   TEXT NOT NULL,
   created_at   INTEGER NOT NULL,
@@ -531,7 +562,7 @@ CREATE TABLE IF NOT EXISTS threads (
 @dataclass(frozen=True)
 class ThreadRow:
     thread_id: str
-    cascade_id: str | None
+    conversation_id: str | None
     workspace: str
     created_by: str
     created_at: int
@@ -551,7 +582,7 @@ class Store:
         now = int(time.time())
         self._db.execute(
             "INSERT OR IGNORE INTO threads"
-            " (thread_id, cascade_id, workspace, created_by,"
+            " (thread_id, conversation_id, workspace, created_by,"
             "  created_at, last_used_at)"
             " VALUES (?, NULL, ?, ?, ?, ?)",
             (thread_id, workspace, created_by, now, now),
@@ -568,10 +599,10 @@ class Store:
         r = cur.fetchone()
         return None if r is None else ThreadRow(**dict(r))
 
-    def set_cascade(self, thread_id: str, cascade_id: str) -> None:
+    def set_conversation(self, thread_id: str, conversation_id: str) -> None:
         self._db.execute(
-            "UPDATE threads SET cascade_id = ? WHERE thread_id = ?",
-            (cascade_id, thread_id),
+            "UPDATE threads SET conversation_id = ? WHERE thread_id = ?",
+            (conversation_id, thread_id),
         )
         self._db.commit()
 
@@ -756,6 +787,44 @@ def test_flush_does_not_double_close_a_balanced_fence():
     assert c.flush() == ["```python\nprint(1)\n```"]
 
 
+def test_sealed_body_with_open_fence_respects_the_limit():
+    c = Chunker()
+    c.feed("```\n")
+    while len(c.current) < LIMIT - 10:
+        c.feed("abcde")
+    bodies = c.feed("xy") + c.flush()
+    assert all(len(b) <= LIMIT for b in bodies), \
+        [len(b) for b in bodies if len(b) > LIMIT]
+
+
+def test_no_body_exceeds_the_limit_while_a_fence_stays_open():
+    c = Chunker()
+    bodies = c.feed("```python\n")
+    for _ in range(200):
+        bodies += c.feed("x" * 37)
+    bodies += c.flush()
+    assert all(len(b) <= LIMIT for b in bodies), \
+        [len(b) for b in bodies if len(b) > LIMIT]
+
+
+def test_flush_of_a_nearly_full_open_fence_respects_the_limit():
+    c = Chunker()
+    c.feed("```\n")
+    while len(c.current) < LIMIT - 6:
+        c.feed("ab")
+    assert all(len(b) <= LIMIT for b in c.flush())
+
+
+def test_overlong_fence_language_is_dropped_on_reopen():
+    c = Chunker()
+    c.feed("```" + "z" * 40 + "\n")
+    c.feed("y" * (LIMIT - 60))
+    sealed = c.feed("more text here")
+    assert sealed, "this feed should have forced a seal"
+    assert c.current.startswith("```\n")
+    assert all(len(b) <= LIMIT for b in sealed)
+
+
 def test_fresh_chunker_carries_no_fence_state():
     c1 = Chunker()
     c1.feed("```python\nunterminated")
@@ -785,6 +854,10 @@ LIMIT = 1800
 # the closing fence always fit.
 RESERVE = 24
 
+# A reopened fence longer than this drops its language tag rather than
+# truncating it, which also keeps the reopened prefix inside RESERVE.
+MAX_FENCE_LANG = 12
+
 
 @dataclass(frozen=True)
 class Text:
@@ -800,7 +873,7 @@ class Tool:
 
 @dataclass(frozen=True)
 class Meta:
-    cascade_id: str
+    conversation_id: str
 
 
 Piece = Text | Tool | Meta
@@ -824,6 +897,24 @@ def fence_state(text: str) -> str | None:
             fence = None
         i = j + 3
     return fence
+
+
+def _close_suffix(body: str) -> str:
+    """The text needed to close this body's open fence, or "" if balanced."""
+    if fence_state(body) is None:
+        return ""
+    return "```" if body.endswith("\n") else "\n```"
+
+
+def sealed_len(body: str) -> int:
+    """Length this body would have once sealed, fence closure included.
+
+    The seal decision uses this rather than len(), so a body that still owes
+    a closing fence reserves room for it instead of overflowing when sealed.
+    Checking at seal time would be too late: by then the body is already
+    at the limit and the closure pushes it past.
+    """
+    return len(body) + len(_close_suffix(body))
 
 
 def _split_oversized(s: str, maxlen: int) -> list[str]:
@@ -872,7 +963,7 @@ class Chunker:
     def feed(self, s: str) -> list[str]:
         sealed: list[str] = []
         for piece in _split_oversized(s, self._limit - RESERVE):
-            if len(self._body) + len(piece) > self._limit:
+            if sealed_len(self._body + piece) > self._limit:
                 sealed.append(self._seal())
             self._body += piece
         return sealed
@@ -888,20 +979,24 @@ class Chunker:
         """Close the current body and start the next, carrying fence state."""
         lang = fence_state(self._body)
         body = self._close_fence(self._body)
-        self._body = "" if lang is None else f"```{lang}\n"
+        if lang is None:
+            self._body = ""
+        else:
+            # An over-long tag is dropped rather than truncated: an unlabelled
+            # block renders better than a mislabelled one.
+            tag = lang if len(lang) <= MAX_FENCE_LANG else ""
+            self._body = f"```{tag}\n"
         return body
 
     @staticmethod
     def _close_fence(body: str) -> str:
-        if fence_state(body) is None:
-            return body
-        return body + ("```" if body.endswith("\n") else "\n```")
+        return body + _close_suffix(body)
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/test_render.py -v`
-Expected: 21 passed
+Expected: 25 passed
 
 - [ ] **Step 5: Commit**
 
@@ -923,7 +1018,7 @@ git commit -m "feat: add 1800-character chunker with code-fence continuation"
 - Produces:
   - `Sink(send, edit, limit=LIMIT, interval=1.5)` where `send` is `async (content: str) -> Any` returning a message handle and `edit` is `async (handle: Any, content: str) -> None`
   - methods `start() -> None`, `feed(piece: Piece) -> None`, `finish(returncode: int, stderr_tail: str = "", cancelled: bool = False) -> None`
-  - attribute `cascade_id: str | None`
+  - attribute `conversation_id: str | None`
   - `fmt_elapsed(seconds: float) -> str`
 
 - [ ] **Step 1: Write the failing tests**
@@ -955,8 +1050,9 @@ def ch():
 
 
 def sink_for(ch) -> Sink:
-    # interval=0 makes the writer flush on every tick, so tests never sleep.
-    return Sink(ch.send, ch.edit, interval=0)
+    # A short interval keeps tests fast without spinning the writer hot.
+    # interval=0 would busy-loop asyncio.sleep(0) for the whole turn.
+    return Sink(ch.send, ch.edit, interval=0.01)
 
 
 def test_fmt_elapsed_under_a_minute():
@@ -1003,7 +1099,7 @@ async def test_meta_is_captured_and_not_displayed(ch):
     await s.feed(Meta("c-abc"))
     await s.feed(Text("body"))
     await s.finish(0)
-    assert s.cascade_id == "c-abc"
+    assert s.conversation_id == "c-abc"
     assert "c-abc" in ch.messages[0]      # only via the footer
     assert ch.messages[0].index("body") < ch.messages[0].index("c-abc")
 
@@ -1057,6 +1153,97 @@ async def test_finish_without_any_output_still_reports(ch):
     await s.start()
     await s.finish(1, stderr_tail="not authenticated")
     assert "not authenticated" in ch.messages[-1]
+
+
+class SuspendingChannel:
+    """A channel whose send and edit genuinely yield to the event loop.
+
+    FakeChannel's coroutines contain no suspension point, so awaiting them
+    never returns control to the loop and the pump task is never scheduled.
+    Concurrency can only be observed through a channel that really suspends.
+    """
+
+    def __init__(self):
+        self.messages: list[str] = []
+
+    async def send(self, content: str) -> int:
+        await asyncio.sleep(0)
+        self.messages.append(content)
+        return len(self.messages) - 1
+
+    async def edit(self, handle: int, content: str) -> None:
+        await asyncio.sleep(0)
+        self.messages[handle] = content
+
+
+def racing_sink(ch) -> Sink:
+    # interval=0 is deliberate here: maximum pump pressure, to force the
+    # interleavings a realistic interval would only hit occasionally.
+    return Sink(ch.send, ch.edit, interval=0)
+
+
+async def test_the_pump_actually_runs():
+    ch = SuspendingChannel()
+    s = racing_sink(ch)
+    await s.start()
+    await s.feed(Text("partial"))
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert ch.messages[0] == "partial", "the pump never wrote anything"
+    await s.finish(0)
+
+
+async def test_pump_cannot_overwrite_a_sealed_message():
+    ch = SuspendingChannel()
+    s = racing_sink(ch)
+    await s.start()
+    await s.feed(Text("a" * (LIMIT - 5)))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    await s.feed(Text("bbbbbbbbbb"))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    await s.finish(0)
+    assert ch.messages[0] == "a" * (LIMIT - 5)
+    assert "bbbbbbbbbb" not in ch.messages[0]
+    assert "bbbbbbbbbb" in ch.messages[1]
+
+
+async def test_finish_is_not_clobbered_by_an_in_flight_pump_edit():
+    ch = SuspendingChannel()
+    s = racing_sink(ch)
+    await s.start()
+    await s.feed(Text("body"))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    await s.finish(0)
+    assert "-# ✅" in ch.messages[-1]
+    assert ch.messages[-1].startswith("body")
+
+
+async def test_no_text_is_lost_or_duplicated_across_many_seals():
+    ch = SuspendingChannel()
+    s = racing_sink(ch)
+    await s.start()
+    for i in range(60):
+        await s.feed(Text(f"[{i:03d}]" + "x" * 60))
+        await asyncio.sleep(0)
+    await s.finish(0)
+    joined = "".join(ch.messages)
+    for i in range(60):
+        assert joined.count(f"[{i:03d}]") == 1, f"marker {i} lost or duplicated"
+
+
+async def test_every_message_stays_within_discords_hard_cap():
+    ch = SuspendingChannel()
+    s = racing_sink(ch)
+    await s.start()
+    for _ in range(40):
+        await s.feed(Text("y" * 120))
+        await asyncio.sleep(0)
+    await s.finish(1, stderr_tail="e" * 500)
+    assert all(len(m) <= 2000 for m in ch.messages), \
+        [len(m) for m in ch.messages if len(m) > 2000]
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1068,8 +1255,11 @@ Expected: `ImportError: cannot import name 'Sink' from 'agybot.render'`
 
 Append to `src/agybot/render.py`:
 
+Hoist the new imports into the module's existing import block rather than leaving them here.
+
 ```python
 import asyncio
+import contextlib
 import time
 from typing import Any, Awaitable, Callable
 
@@ -1103,9 +1293,10 @@ class Sink:
         self._handle: Any = None
         self._dirty = False
         self._writer: asyncio.Task | None = None
+        self._lock = asyncio.Lock()
         self._started = 0.0
         self._tools = 0
-        self.cascade_id: str | None = None
+        self.conversation_id: str | None = None
 
     async def start(self) -> None:
         self._started = time.monotonic()
@@ -1114,7 +1305,7 @@ class Sink:
 
     async def feed(self, piece: Piece) -> None:
         if isinstance(piece, Meta):
-            self.cascade_id = piece.cascade_id
+            self.conversation_id = piece.conversation_id
             return
 
         if isinstance(piece, Tool):
@@ -1124,40 +1315,51 @@ class Sink:
         else:
             text = piece.s
 
-        for sealed in self._chunker.feed(text):
-            await self._edit(self._handle, sealed)
-            self._handle = await self._send(self._chunker.current or "…")
-        self._dirty = True
+        # The chunker advance and the handle repoint must be atomic with
+        # respect to the pump, which reads both. Splitting them lets the pump
+        # write the next body onto the previous, already-sealed message.
+        async with self._lock:
+            for sealed in self._chunker.feed(text):
+                await self._edit(self._handle, sealed)
+                self._handle = await self._send(self._chunker.current or "…")
+            self._dirty = True
 
     async def finish(self, returncode: int, stderr_tail: str = "",
                      cancelled: bool = False) -> None:
-        if self._writer is not None:
-            self._writer.cancel()
-            self._writer = None
+        writer, self._writer = self._writer, None
+        if writer is not None:
+            writer.cancel()
+            # Awaiting the cancelled task guarantees no pump edit is still in
+            # flight; otherwise one can land after the footer and clobber it.
+            # This await is outside the lock, because the writer may itself be
+            # waiting to acquire it.
+            with contextlib.suppress(asyncio.CancelledError):
+                await writer
 
-        footer = self._footer(returncode, stderr_tail, cancelled)
-        bodies = self._chunker.flush()
-        body = bodies[0] if bodies else ""
+        async with self._lock:
+            footer = self._footer(returncode, stderr_tail, cancelled)
+            bodies = self._chunker.flush()
+            body = bodies[0] if bodies else ""
 
-        # flush() yields at most one body, so the footer joins it whenever
-        # the pair fits inside Discord's hard 2000-character message cap.
-        if len(body) + len(footer) <= 2000:
-            await self._edit(self._handle, (body + footer) or PLACEHOLDER)
-        else:
-            await self._edit(self._handle, body)
-            self._handle = await self._send(footer)
+            # flush() yields at most one body, so the footer joins it whenever
+            # the pair fits inside Discord's hard 2000-character message cap.
+            if len(body) + len(footer) <= 2000:
+                await self._edit(self._handle, (body + footer) or PLACEHOLDER)
+            else:
+                await self._edit(self._handle, body)
+                self._handle = await self._send(footer)
 
     def _footer(self, returncode: int, stderr_tail: str,
                 cancelled: bool) -> str:
         elapsed = fmt_elapsed(time.monotonic() - self._started)
-        cid = self.cascade_id or "unknown"
+        cid = self.conversation_id or "unknown"
         if cancelled:
             head = "-# 🛑 cancelled"
         elif returncode == 0:
             head = "-# ✅"
         else:
             head = f"-# ❌ exit {returncode}"
-        out = f"\n{head} · {elapsed} · {self._tools} tools · cascade {cid}"
+        out = f"\n{head} · {elapsed} · {self._tools} tools · conv {cid}"
         if returncode != 0 and stderr_tail:
             out += f"\n```\n{stderr_tail[-STDERR_TAIL:]}\n```"
         return out
@@ -1166,10 +1368,11 @@ class Sink:
         try:
             while True:
                 await asyncio.sleep(self._interval)
-                if self._dirty:
-                    self._dirty = False
-                    await self._edit(self._handle,
-                                     self._chunker.current or PLACEHOLDER)
+                async with self._lock:
+                    if self._dirty:
+                        self._dirty = False
+                        await self._edit(self._handle,
+                                         self._chunker.current or PLACEHOLDER)
         except asyncio.CancelledError:
             pass
 ```
@@ -1179,7 +1382,7 @@ Note the `finish` path. `Chunker.flush()` returns at most one body, so the foote
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/test_render.py -v`
-Expected: 34 passed
+Expected: 43 passed
 
 - [ ] **Step 5: Commit**
 
@@ -1199,7 +1402,7 @@ git commit -m "feat: add throttled Discord sink with footers and tool subtext"
 **Interfaces:**
 - Consumes: nothing.
 - Produces:
-  - `build_argv(agy_bin: str, prompt: str, workspace: str, cascade_id: str | None, tier: str, timeout: str = "15m") -> list[str]`
+  - `build_argv(agy_bin: str, prompt: str, workspace: str, conversation_id: str | None, tier: str, timeout: str = "15m") -> list[str]`
   - `minimal_env(base: Mapping[str, str]) -> dict[str, str]`
   - `ENV_ALLOWLIST: frozenset[str]`
 
@@ -1213,20 +1416,30 @@ from agybot.runner import build_argv, minimal_env
 
 def argv(**kw):
     base = dict(agy_bin="agy", prompt="do the thing",
-                workspace="/srv/agy/app", cascade_id=None, tier="owner")
+                workspace="/srv/agy/app", conversation_id=None, tier="owner")
     base.update(kw)
     return build_argv(**base)
 
 
 def test_prompt_is_a_single_argument():
     a = argv(prompt="rm -rf /; echo `whoami`")
-    assert "rm -rf /; echo `whoami`" in a
+    assert a[a.index("-p") + 1] == "rm -rf /; echo `whoami`"
 
 
 def test_prompt_is_not_escaped_or_quoted():
     a = argv(prompt='say "hi"')
-    assert 'say "hi"' in a
+    assert a[a.index("-p") + 1] == 'say "hi"'
     assert '\\"' not in " ".join(a)
+
+
+def test_a_prompt_that_looks_like_a_flag_cannot_smuggle_privileges():
+    """agy's parser takes the token after -p as its value even when that token
+    begins with dashes, so a member writing a privileged flag as their prompt
+    gets it treated as prompt text. This asserts the prompt stays adjacent to
+    -p and that the flag never appears anywhere a parser would read it."""
+    a = argv(prompt="--dangerously-skip-permissions", tier="member")
+    assert a[a.index("-p") + 1] == "--dangerously-skip-permissions"
+    assert "--dangerously-skip-permissions" not in a[a.index("-p") + 2:]
 
 
 def test_stream_json_output_is_requested():
@@ -1265,11 +1478,11 @@ def test_stranger_tier_is_rejected_outright():
 
 
 def test_new_conversation_omits_the_conversation_flag():
-    assert "--conversation" not in argv(cascade_id=None)
+    assert "--conversation" not in argv(conversation_id=None)
 
 
 def test_resumed_conversation_passes_the_id():
-    a = argv(cascade_id="c-abc")
+    a = argv(conversation_id="c-abc")
     assert a[a.index("--conversation") + 1] == "c-abc"
 
 
@@ -1325,7 +1538,7 @@ ENV_ALLOWLIST = frozenset({
 
 
 def build_argv(agy_bin: str, prompt: str, workspace: str,
-               cascade_id: str | None, tier: str,
+               conversation_id: str | None, tier: str,
                timeout: str = "15m") -> list[str]:
     if tier not in ("owner", "member"):
         raise ValueError(f"cannot build a command for tier {tier!r}")
@@ -1336,8 +1549,8 @@ def build_argv(agy_bin: str, prompt: str, workspace: str,
         "--add-dir", workspace,
         "--print-timeout", timeout,
     ]
-    if cascade_id:
-        argv += ["--conversation", cascade_id]
+    if conversation_id:
+        argv += ["--conversation", conversation_id]
     if tier == "owner":
         argv += ["--dangerously-skip-permissions"]
     else:
@@ -1355,7 +1568,7 @@ If Task 1 found that the prompt is a flag value rather than positional, change t
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/test_runner.py -v`
-Expected: 16 passed
+Expected: 17 passed
 
 - [ ] **Step 5: Commit**
 
@@ -1368,7 +1581,7 @@ git commit -m "feat: add agy argv construction and environment scrubbing"
 
 ### Task 7: The event adapter
 
-Write this task against `docs/agy-stream-schema.md` from Task 1. The code below encodes the expected shape; reconcile every JSON path with what the schema document actually records before running the tests.
+Write this task against `docs/agy-stream-schema.md`, produced by Task 1 from a real capture. The schema below is observed fact, not assumption — do not "correct" it back toward anything the CLI help implies.
 
 **Files:**
 - Modify: `src/agybot/runner.py` (append `EventAdapter`)
@@ -1377,6 +1590,17 @@ Write this task against `docs/agy-stream-schema.md` from Task 1. The code below 
 **Interfaces:**
 - Consumes: `Text`, `Tool`, `Meta`, `Piece` from `agybot.render`.
 - Produces: `EventAdapter()` with `feed(ev: dict) -> list[Piece]`
+
+The observed event shapes, for reference while writing:
+
+```
+{"event":"init","conversation_id":"cab28252-...","init":{"cwd":"...","tools":[...]}}
+{"event":"step_update","step_update":{"step_index":0,"state":"DONE","step_type":"user_input"}}
+{"event":"step_update","step_update":{"step_index":3,"state":"ACTIVE","step_type":"agent_response","text_delta":"Starting the check"}}
+{"event":"step_update","step_update":{"step_index":2,"state":"ACTIVE","step_type":"tool","tool_name":"view_file","tool_info":{"name":"view_file","parameters":{"AbsolutePath":"/tmp/agy-probe/probe.txt"}}}}
+{"event":"step_update","step_update":{"step_index":2,"state":"DONE","step_type":"tool","tool_name":"view_file","duration_seconds":0.32,"tool_info":{"parameters":{...},"output":"2 lines, 6 bytes"}}}
+{"event":"result","result":{"status":"SUCCESS","duration_seconds":10.37,"usage":{"total_tokens":30565}}}
+```
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1389,161 +1613,262 @@ import pytest
 from agybot.runner import EventAdapter
 from agybot.render import Text, Tool, Meta
 
-FIXTURE = Path(__file__).parent / "fixtures" / "agy_stream_sample.ndjson"
+FIXTURES = Path(__file__).parent / "fixtures"
+FIXTURE = FIXTURES / "agy_stream_sample.ndjson"
+MULTICHUNK = FIXTURES / "agy_stream_multichunk.ndjson"
+
+
+def replay(path: Path) -> list:
+    a = EventAdapter()
+    pieces = []
+    for line in path.read_text().splitlines():
+        if line.strip():
+            pieces += a.feed(json.loads(line))
+    return pieces
+
+
+def init_ev(cid: str = "c-1") -> dict:
+    return {"event": "init", "conversation_id": cid,
+            "init": {"cwd": "/tmp", "tools": []}}
+
+
+def step(**kw) -> dict:
+    return {"event": "step_update", "step_update": kw}
 
 
 def test_init_event_yields_the_conversation_id():
+    assert EventAdapter().feed(init_ev()) == [Meta("c-1")]
+
+
+def test_conversation_id_is_emitted_only_once():
     a = EventAdapter()
-    out = a.feed({"type": "system", "subtype": "init", "cascade_id": "c-1"})
-    assert out == [Meta("c-1")]
+    a.feed(init_ev())
+    assert a.feed(init_ev()) == []
 
 
-def test_assistant_text_yields_a_text_piece():
+def test_result_event_yields_nothing():
+    ev = {"event": "result", "result": {"status": "SUCCESS"}}
+    assert EventAdapter().feed(ev) == []
+
+
+def test_user_input_step_yields_nothing():
+    assert EventAdapter().feed(
+        step(step_index=0, state="DONE", step_type="user_input")) == []
+
+
+def test_agent_response_delta_yields_text():
+    assert EventAdapter().feed(
+        step(step_type="agent_response", state="ACTIVE",
+             text_delta="hello")) == [Text("hello")]
+
+
+def test_agent_response_without_text_delta_yields_nothing():
+    assert EventAdapter().feed(
+        step(step_type="agent_response", state="ACTIVE")) == []
+
+
+def test_consecutive_deltas_are_emitted_in_arrival_order():
     a = EventAdapter()
-    a.feed({"type": "system", "subtype": "init", "cascade_id": "c-1"})
-    out = a.feed({"type": "assistant", "text": "hello"})
-    assert out == [Text("hello")]
-
-
-def test_unknown_event_yields_nothing():
-    assert EventAdapter().feed({"type": "something_new"}) == []
-
-
-def test_empty_text_yields_nothing():
-    assert EventAdapter().feed({"type": "assistant", "text": ""}) == []
+    out = (a.feed(step(step_type="agent_response", state="ACTIVE",
+                       text_delta="Star"))
+           + a.feed(step(step_type="agent_response", state="DONE",
+                         text_delta="ted.")))
+    assert out == [Text("Star"), Text("ted.")]
 
 
 def test_tool_start_yields_a_pending_tool_piece():
-    out = EventAdapter().feed(
-        {"type": "tool_use", "name": "read", "input": {"path": "auth.py"}})
-    assert out == [Tool("read", "auth.py", None)]
+    ev = step(step_type="tool", state="ACTIVE", tool_name="view_file",
+              tool_info={"name": "view_file",
+                         "parameters": {"AbsolutePath": "/tmp/probe.txt"}})
+    assert EventAdapter().feed(ev) == [Tool("view_file", "/tmp/probe.txt",
+                                            None)]
 
 
-def test_tool_result_marks_failure():
+def test_tool_done_is_not_rendered_twice():
+    ev = step(step_type="tool", state="DONE", tool_name="view_file",
+              tool_info={"parameters": {"AbsolutePath": "/tmp/probe.txt"},
+                         "output": "2 lines, 6 bytes"})
+    assert EventAdapter().feed(ev) == []
+
+
+def test_unknown_tool_state_renders_nothing():
+    ev = step(step_type="tool", state="PENDING", tool_name="x",
+              tool_info={"parameters": {}})
+    assert EventAdapter().feed(ev) == []
+
+
+def test_a_non_dict_event_is_ignored():
     a = EventAdapter()
-    a.feed({"type": "tool_use", "name": "bash", "input": {"command": "false"}})
-    out = a.feed({"type": "tool_result", "name": "bash", "is_error": True})
-    assert out == [Tool("bash", "failed", False)]
+    for junk in ("a string", ["a", "list"], 42, None):
+        assert a.feed(junk) == []
 
 
-def test_successful_tool_result_is_not_rendered_twice():
-    a = EventAdapter()
-    a.feed({"type": "tool_use", "name": "read", "input": {"path": "a.py"}})
-    assert a.feed({"type": "tool_result", "name": "read",
-                   "is_error": False}) == []
+def test_a_non_dict_step_update_is_ignored():
+    assert EventAdapter().feed(
+        {"event": "step_update", "step_update": "oops"}) == []
 
 
-def test_cascade_id_is_emitted_only_once():
-    a = EventAdapter()
-    a.feed({"type": "system", "subtype": "init", "cascade_id": "c-1"})
-    out = a.feed({"type": "system", "subtype": "init", "cascade_id": "c-1"})
-    assert out == []
+def test_a_non_dict_tool_info_does_not_crash():
+    ev = step(step_type="tool", state="ACTIVE", tool_name="x",
+              tool_info="oops")
+    assert EventAdapter().feed(ev) == [Tool("x", "", None)]
 
 
-@pytest.mark.skipif(not FIXTURE.exists(), reason="Task 1 fixture not captured")
+def test_non_dict_parameters_do_not_crash():
+    ev = step(step_type="tool", state="ACTIVE", tool_name="x",
+              tool_info={"parameters": ["a", "b"]})
+    assert EventAdapter().feed(ev) == [Tool("x", "", None)]
+
+
+def test_a_non_string_text_delta_is_ignored():
+    assert EventAdapter().feed(
+        step(step_type="agent_response", state="ACTIVE", text_delta=42)) == []
+
+
+def test_tool_without_recognised_parameters_has_an_empty_detail():
+    ev = step(step_type="tool", state="ACTIVE", tool_name="mystery",
+              tool_info={"parameters": {"Weird": "x"}})
+    assert EventAdapter().feed(ev) == [Tool("mystery", "", None)]
+
+
+def test_unknown_event_yields_nothing():
+    assert EventAdapter().feed({"event": "something_new"}) == []
+
+
+def test_step_update_without_a_payload_yields_nothing():
+    assert EventAdapter().feed({"event": "step_update"}) == []
+
+
 def test_recorded_stream_produces_a_sane_piece_sequence():
-    a = EventAdapter()
-    pieces = []
-    for line in FIXTURE.read_text().splitlines():
-        if line.strip():
-            pieces += a.feed(json.loads(line))
+    pieces = replay(FIXTURE)
 
     metas = [p for p in pieces if isinstance(p, Meta)]
     assert len(metas) == 1, "exactly one conversation id per turn"
-    assert metas[0].cascade_id, "conversation id must not be empty"
+    assert metas[0].conversation_id, "conversation id must not be empty"
     assert any(isinstance(p, Text) and p.s.strip() for p in pieces), \
         "the recorded turn produced no assistant text"
-    assert any(isinstance(p, Tool) for p in pieces), \
-        "the recorded turn was supposed to use a tool"
+    tools = [p for p in pieces if isinstance(p, Tool)]
+    assert tools, "the recorded turn was supposed to use a tool"
+    assert all(t.ok is None for t in tools), \
+        "every tool in the recorded turn succeeded, so none should be flagged"
+
+
+def test_multichunk_fixture_reassembles_exactly():
+    """The sample fixture cannot tell append from replace: its one text-bearing
+    step emits everything in a single event. This fixture can — step_index 3
+    arrives as five disjoint deltas whose concatenation equals the turn's
+    result.response, so the assertion is exact rather than a containment check
+    that duplication could also satisfy."""
+    events = [json.loads(line) for line in MULTICHUNK.read_text().splitlines()
+              if line.strip()]
+    expected = next(e["result"]["response"] for e in events
+                    if e.get("event") == "result")
+    texts = [p.s for p in replay(MULTICHUNK) if isinstance(p, Text)]
+    assert len(texts) >= 2, "this fixture must exercise multi-chunk text"
+    assert "".join(texts) == expected
 ```
 
-The fixture test asserts properties rather than exact strings, so it stays valid whatever the recorded run happened to say. If it fails, the adapter's JSON paths disagree with reality and the adapter is wrong, not the test.
+The fixture test asserts properties rather than exact strings, so it stays valid whatever the recorded run happened to say. If it fails, the adapter disagrees with reality and the adapter is wrong, not the fixture.
+
+Note `test_recorded_stream_produces_a_sane_piece_sequence` expects exactly one `Meta` even though `conversation_id` is echoed on every event in the stream: only the `init` event is a source of `Meta`, and the adapter emits at most one.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `.venv/bin/pytest tests/test_runner.py -v -k "adapter or event or tool_ or cascade or recorded"`
+Run: `.venv/bin/pytest tests/test_runner.py -v -k "adapter or event or tool_ or conversation or recorded or delta or step"`
 Expected: `ImportError: cannot import name 'EventAdapter' from 'agybot.runner'`
 
 - [ ] **Step 3: Write the implementation**
 
-Append to `src/agybot/runner.py`:
+Append to `src/agybot/runner.py`, hoisting the import to the module's import block:
 
 ```python
 from agybot.render import Meta, Piece, Text, Tool
 
-# Keys checked in order when summarising a tool's input for display.
-TOOL_DETAIL_KEYS = ("path", "file_path", "command", "pattern", "query", "url")
+# Parameter keys checked in order when summarising a tool call for display.
+# agy's built-in tools use PascalCase; the lowercase spellings cover MCP and
+# plugin tools that follow other conventions.
+TOOL_DETAIL_KEYS = (
+    "AbsolutePath", "Path", "path", "file_path",
+    "Command", "command", "Query", "query", "url",
+)
 
 
 class EventAdapter:
     """Translates agy stream-json events into render pieces.
 
-    The only component that knows the CLI's event schema. Everything
-    downstream sees Text, Tool, and Meta and nothing else.
+    The only component that knows the CLI's event schema, which is pinned by
+    observation in docs/agy-stream-schema.md. Everything downstream sees
+    Text, Tool, and Meta and nothing else.
     """
 
     def __init__(self) -> None:
-        self._cascade_sent = False
+        self._conversation_sent = False
 
-    def feed(self, ev: dict) -> list[Piece]:
-        kind = ev.get("type")
+    def feed(self, ev: object) -> list[Piece]:
+        # Runs per line of a live subprocess stream, so it must never raise:
+        # an exception here aborts the user's turn mid-answer. Every field is
+        # type-checked rather than merely presence-checked.
+        if not isinstance(ev, dict):
+            return []
 
-        if kind == "system" and not self._cascade_sent:
-            cid = ev.get("cascade_id") or ev.get("conversation_id")
-            if cid:
-                self._cascade_sent = True
+        kind = ev.get("event")
+
+        if kind == "init":
+            cid = ev.get("conversation_id")
+            if cid and not self._conversation_sent:
+                self._conversation_sent = True
                 return [Meta(str(cid))]
             return []
 
-        if kind == "assistant":
-            text = ev.get("text") or ""
-            return [Text(text)] if text else []
+        if kind == "step_update":
+            su = ev.get("step_update")
+            return self._step(su) if isinstance(su, dict) else []
 
-        if kind == "tool_use":
-            return [Tool(str(ev.get("name", "tool")),
-                         _detail(ev.get("input") or {}), None)]
+        return []
 
-        if kind == "tool_result":
-            if ev.get("is_error"):
-                return [Tool(str(ev.get("name", "tool")), "failed", False)]
+    def _step(self, su: dict) -> list[Piece]:
+        step_type = su.get("step_type")
+
+        if step_type == "agent_response":
+            # text_delta is incremental and frequently absent; emitting each
+            # delta in arrival order reconstructs the response exactly.
+            delta = su.get("text_delta")
+            return [Text(delta)] if isinstance(delta, str) and delta else []
+
+        if step_type == "tool":
+            state = su.get("state")
+            if state == "ACTIVE":
+                name = str(su.get("tool_name") or "tool")
+                info = su.get("tool_info")
+                params = info.get("parameters") if isinstance(info, dict) else None
+                detail = _detail(params if isinstance(params, dict) else {})
+                return [Tool(name, detail, None)]
+            # DONE renders nothing, because the call was announced when it
+            # started. Any other state renders nothing either: tool failure
+            # signalling was never observed, and docs/agy-stream-schema.md
+            # question 4 says to treat unknown states as unhandled rather than
+            # assume they mean failure. When a real failing tool is captured,
+            # add the branch then.
             return []
 
         return []
 
 
-def _detail(payload: dict) -> str:
+def _detail(parameters: dict) -> str:
     for key in TOOL_DETAIL_KEYS:
-        if payload.get(key):
-            return str(payload[key])[:80]
+        if parameters.get(key):
+            return str(parameters[key])[:80]
     return ""
 ```
 
-- [ ] **Step 4: Reconcile against the observed schema**
-
-Open `docs/agy-stream-schema.md` and check each of the five answers against the code:
-
-- If the conversation id lives at a nested path such as `session.cascade_id`, change the lookup in the `system` branch.
-- If assistant text is a **cumulative snapshot** rather than an incremental delta, the adapter must diff. Add `self._emitted = 0` to `__init__` and replace the `assistant` branch with:
-
-```python
-        if kind == "assistant":
-            full = ev.get("text") or ""
-            delta = full[self._emitted:]
-            self._emitted = len(full)
-            return [Text(delta)] if delta else []
-```
-
-- If tool start and result use different `type` values than `tool_use` and `tool_result`, rename the two branches.
-- If failure is signalled by a field other than `is_error`, change that check.
-
-- [ ] **Step 5: Run the tests to verify they pass**
+- [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/test_runner.py -v`
-Expected: 25 passed
+Expected: 37 passed
 
 If `test_recorded_stream_produces_a_sane_piece_sequence` fails, the adapter disagrees with the captured stream. Fix the adapter, never the fixture.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add src/agybot/runner.py tests/test_runner.py
@@ -1739,7 +2064,7 @@ class Slots:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/test_runner.py -v`
-Expected: 35 passed
+Expected: 47 passed
 
 - [ ] **Step 5: Commit**
 
@@ -1778,9 +2103,17 @@ import sys
 import time
 
 
+CID = "c-fake"
+
+
 def emit(obj) -> None:
     sys.stdout.write(json.dumps(obj) + "\n")
     sys.stdout.flush()
+
+
+def step(**kw) -> None:
+    emit({"event": "step_update",
+          "step_update": {"conversation_id": CID, **kw}})
 
 
 mode = os.environ.get("FAKE_AGY_MODE", "normal")
@@ -1789,7 +2122,9 @@ if mode == "fail":
     sys.stderr.write("fatal: not authenticated with Antigravity\n")
     sys.exit(1)
 
-emit({"type": "system", "subtype": "init", "cascade_id": "c-fake"})
+emit({"event": "init", "conversation_id": CID,
+      "init": {"cwd": os.getcwd(), "tools": ["view_file"]}})
+step(step_index=0, state="DONE", step_type="user_input")
 
 if mode in ("slow", "spawnchild"):
     if mode == "spawnchild":
@@ -1800,12 +2135,28 @@ if mode in ("slow", "spawnchild"):
             "pathlib.Path(sys.argv[1]).write_text('alive')",
             marker,
         ])
-    emit({"type": "assistant", "text": "starting"})
+    step(step_index=1, state="ACTIVE", step_type="agent_response",
+         text_delta="starting")
     time.sleep(30)
 
-emit({"type": "tool_use", "name": "read", "input": {"path": "probe.txt"}})
-emit({"type": "assistant", "text": "the word is banana"})
-emit({"type": "result", "subtype": "success"})
+params = {"AbsolutePath": "probe.txt"}
+step(step_index=2, state="ACTIVE", step_type="tool", tool_name="view_file",
+     tool_info={"name": "view_file", "parameters": params})
+step(step_index=2, state="DONE", step_type="tool", tool_name="view_file",
+     duration_seconds=0.3,
+     tool_info={"name": "view_file", "parameters": params,
+                "output": "1 line, 7 bytes"})
+
+# Split across two deltas so the test exercises incremental reassembly.
+step(step_index=3, state="ACTIVE", step_type="agent_response",
+     text_delta="the word is ")
+step(step_index=3, state="DONE", step_type="agent_response",
+     text_delta="banana")
+
+emit({"event": "result",
+      "result": {"conversation_id": CID, "status": "SUCCESS",
+                 "duration_seconds": 0.5, "num_turns": 1,
+                 "usage": {"total_tokens": 42}}})
 ```
 
 ```bash
@@ -1841,7 +2192,7 @@ class RecordingChannel:
 
 def turn_for(mode: str, tmp_path, wall_timeout: float = 960, **env_extra):
     ch = RecordingChannel()
-    sink = Sink(ch.send, ch.edit, interval=0)
+    sink = Sink(ch.send, ch.edit, interval=0.01)
     env = {"FAKE_AGY_MODE": mode, "PATH": os.environ["PATH"], **env_extra}
     t = Turn([sys.executable, FAKE], cwd=str(tmp_path), env=env,
              sink=sink, wall_timeout=wall_timeout)
@@ -1856,7 +2207,7 @@ async def test_successful_turn_exits_zero(tmp_path):
 async def test_successful_turn_captures_the_conversation_id(tmp_path):
     t, sink, _ = turn_for("normal", tmp_path)
     await t.run()
-    assert sink.cascade_id == "c-fake"
+    assert sink.conversation_id == "c-fake"
 
 
 async def test_successful_turn_renders_text_and_tools(tmp_path):
@@ -1864,7 +2215,7 @@ async def test_successful_turn_renders_text_and_tools(tmp_path):
     await t.run()
     whole = "\n".join(ch.messages)
     assert "the word is banana" in whole
-    assert "🔧 read · probe.txt" in whole
+    assert "🔧 view_file · probe.txt" in whole
     assert "-# ✅" in whole
 
 
@@ -1926,6 +2277,10 @@ WALL_TIMEOUT = 960.0          # 16 minutes, backstop for --print-timeout 15m
 KILL_GRACE = 5.0
 STDERR_KEEP = 4096
 
+# asyncio's default 64 KiB readline cap is too small for a result event
+# carrying a long answer or a large tool output.
+STREAM_LIMIT = 4 * 1024 * 1024
+
 
 class Turn:
     """One agy invocation, streamed into a sink."""
@@ -1951,7 +2306,14 @@ class Turn:
             cwd=self._cwd,
             env=self._env,
             start_new_session=True,
+            limit=STREAM_LIMIT,
         )
+
+        # A cancel() that arrived while the sink was starting had no process
+        # to signal. Honour it now rather than running the turn to completion
+        # and reporting it to the user as cancelled.
+        if self.cancelled:
+            await self._kill()
 
         stderr_task = asyncio.create_task(self._proc.stderr.read())
         watchdog = asyncio.create_task(self._watchdog())
@@ -1968,12 +2330,29 @@ class Turn:
                     await self._sink.feed(piece)
 
             returncode = await self._proc.wait()
+            stderr = (await stderr_task).decode("utf-8", "replace")
+        except BaseException as exc:
+            # Anything escaping this loop — a Discord failure raised by the
+            # sink, a stream overrun, cancellation of this coroutine — must
+            # not leave the process group running. start_new_session means
+            # nothing else will ever reap it.
+            await self._kill()
+            # Leave the user a footer rather than a message frozen at the
+            # placeholder. A sink that is itself the cause may raise again;
+            # that must never mask the original failure.
+            with contextlib.suppress(Exception):
+                await self._sink.finish(-1, f"{type(exc).__name__}: {exc}",
+                                        cancelled=self.cancelled)
+            raise
         finally:
             watchdog.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await watchdog
+            if not stderr_task.done():
+                stderr_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await stderr_task
 
-        stderr = (await stderr_task).decode("utf-8", "replace")
         await self._sink.finish(returncode, stderr[-STDERR_KEEP:],
                                 cancelled=self.cancelled)
         return returncode
@@ -2010,7 +2389,7 @@ The signal goes to the process group, not the process, because `start_new_sessio
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 42 passed in `test_runner.py`, 98 across the suite
+Expected: 60 passed in `test_runner.py`, 128 across the suite
 
 - [ ] **Step 6: Commit**
 
@@ -2113,6 +2492,7 @@ Expected: collection error, `ModuleNotFoundError: No module named 'agybot.bot'`
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
@@ -2241,44 +2621,58 @@ class AgyBot(discord.Client):
             if row is None:
                 return
 
+            async def send(content: str):
+                return await thread.send(content)
+
+            async def edit(handle, content: str) -> None:
+                await handle.edit(content=content)
+
+            sink = Sink(send, edit)
+            turn = Turn(
+                argv=build_argv(self.cfg.agy_bin, prompt, row.workspace,
+                                row.conversation_id, tier),
+                cwd=row.workspace,
+                env=minimal_env(os.environ),
+                sink=sink,
+                adapter=EventAdapter(),
+            )
+            # Registered before queueing, so a cancel arriving while this
+            # request waits for a slot is honoured instead of silently
+            # ignored. Turn.cancel() on an unspawned turn just sets the flag.
+            self.turns[thread.id] = turn
+            self.owners[thread.id] = author_id
+
             notice = None
             if self.slots.would_block(tier):
                 notice = await thread.send(
                     f"⏳ queued · {self.slots.ahead(tier)} ahead")
 
-            await self.slots.acquire(tier)
+            try:
+                await self.slots.acquire(tier)
+            except BaseException:
+                self.turns.pop(thread.id, None)
+                self.owners.pop(thread.id, None)
+                raise
+
             try:
                 if notice is not None:
-                    await notice.delete()
+                    # Losing the notice must not lose the request.
+                    with contextlib.suppress(Exception):
+                        await notice.delete()
 
-                async def send(content: str):
-                    return await thread.send(content)
+                if turn.cancelled:
+                    await thread.send("🛑 Cancelled before it started.")
+                    return
 
-                async def edit(handle, content: str) -> None:
-                    await handle.edit(content=content)
+                await turn.run()
 
-                sink = Sink(send, edit)
-                turn = Turn(
-                    argv=build_argv(self.cfg.agy_bin, prompt, row.workspace,
-                                    row.cascade_id, tier),
-                    cwd=row.workspace,
-                    env=minimal_env(os.environ),
-                    sink=sink,
-                    adapter=EventAdapter(),
-                )
-                self.turns[thread.id] = turn
-                self.owners[thread.id] = author_id
-                try:
-                    await turn.run()
-                finally:
-                    self.turns.pop(thread.id, None)
-                    self.owners.pop(thread.id, None)
-
-                if sink.cascade_id and not row.cascade_id:
-                    self.store.set_cascade(str(thread.id), sink.cascade_id)
+                if sink.conversation_id and not row.conversation_id:
+                    self.store.set_conversation(str(thread.id), sink.conversation_id)
                 self.store.touch(str(thread.id))
             finally:
                 self.slots.release()
+                self.turns.pop(thread.id, None)
+                self.owners.pop(thread.id, None)
 
     async def _cancel(self, thread: discord.Thread, user_id: str) -> None:
         turn = self.turns.get(thread.id)
@@ -2314,8 +2708,8 @@ if __name__ == "__main__":
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `.venv/bin/pytest tests/test_bot.py -v`
-Expected: 11 passed
+Run: `.venv/bin/pytest tests/ -v`
+Expected: 11 passed in `tests/test_bot.py`, 139 across the suite
 
 - [ ] **Step 5: Commit**
 
@@ -2340,7 +2734,7 @@ The spec requires that the bot refuse to boot with a missing `agy`, and that str
 - Produces:
   - `PreflightError(Exception)`
   - `preflight(cfg: Config) -> None`
-  - `sweep_stray_agy(agy_bin: str) -> int` returning the number of signals sent
+  - `sweep_stray_agy(agy_bin: str) -> int` returning 1 if anything was signalled, 0 otherwise (`pkill` reports no count)
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2427,6 +2821,8 @@ def preflight(cfg) -> None:
             f"agy binary not found: {cfg.agy_bin!r}. "
             "Install it or set AGY_BIN."
         )
+    if not path.is_file():
+        raise PreflightError(f"agy binary is not a file: {path}")
     if not os.access(path, os.X_OK):
         raise PreflightError(f"agy binary is not executable: {path}")
 
@@ -2438,6 +2834,9 @@ def preflight(cfg) -> None:
         if not p.is_dir():
             raise PreflightError(
                 f"workspace {name!r} is not a directory: {location}")
+        if not os.access(p, os.R_OK | os.X_OK):
+            raise PreflightError(
+                f"workspace {name!r} is not readable by this user: {location}")
 
 
 def sweep_stray_agy(agy_bin: str) -> int:
@@ -2448,11 +2847,24 @@ def sweep_stray_agy(agy_bin: str) -> int:
     account for interactive agy sessions.
     """
     pattern = f"{Path(agy_bin).name} -p"
-    result = subprocess.run(
-        ["pkill", "-u", str(os.getuid()), "-f", pattern],
-        capture_output=True,
-    )
-    return 1 if result.returncode == 0 else 0
+    try:
+        result = subprocess.run(
+            ["pkill", "-u", str(os.getuid()), "-f", pattern],
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        # A minimal host may not ship procps. Orphans from a previous run
+        # would survive, so this must be visible rather than silent.
+        log.warning("pkill is not installed; cannot sweep stray agy processes")
+        return 0
+
+    if result.returncode == 0:
+        return 1
+    if result.returncode == 1:
+        return 0                      # nothing matched, the normal case
+    log.warning("pkill failed (exit %s): %s", result.returncode,
+                result.stderr.decode("utf-8", "replace").strip())
+    return 0
 ```
 
 - [ ] **Step 4: Wire them into startup**
@@ -2484,7 +2896,7 @@ from agybot.runner import (
 - [ ] **Step 5: Run the whole suite**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 115 passed
+Expected: 150 passed
 
 - [ ] **Step 6: Commit**
 
@@ -2625,7 +3037,7 @@ python3 -m venv .venv
 - [ ] **Step 3: Run the full suite one last time**
 
 Run: `.venv/bin/pytest tests/ -v`
-Expected: 115 passed
+Expected: 150 passed
 
 - [ ] **Step 4: Commit**
 

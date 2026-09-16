@@ -5,3 +5,6 @@ config.toml
 *.db
 *.db-wal
 *.db-shm
+.superpowers/
+*.egg-info/
+.env.local
