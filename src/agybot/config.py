@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Mapping
 
 
@@ -22,9 +23,9 @@ class Config:
     members: frozenset[str]
     channels: frozenset[str]
     default_workspace: str
-    workspaces: dict[str, str]
+    workspaces: Mapping[str, str]
     agy_bin: str
-    token: str
+    token: str = field(repr=False)
 
 
 def load_config(path: Path, env: Mapping[str, str]) -> Config:
@@ -39,6 +40,11 @@ def load_config(path: Path, env: Mapping[str, str]) -> Config:
     if not workspaces:
         raise ValueError("config defines no [workspaces]")
 
+    relative = sorted(n for n, p in workspaces.items() if not Path(p).is_absolute())
+    if relative:
+        raise ValueError(
+            f"workspace paths must be absolute: {', '.join(relative)}")
+
     default_workspace = str(raw["default_workspace"])
     if default_workspace not in workspaces:
         raise ValueError(
@@ -50,7 +56,7 @@ def load_config(path: Path, env: Mapping[str, str]) -> Config:
         members=frozenset(str(m) for m in raw.get("members", [])),
         channels=frozenset(str(c) for c in raw.get("channels", [])),
         default_workspace=default_workspace,
-        workspaces=workspaces,
+        workspaces=MappingProxyType(workspaces),
         agy_bin=env.get("AGY_BIN", "agy"),
         token=token,
     )

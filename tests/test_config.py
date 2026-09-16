@@ -95,3 +95,20 @@ def test_default_workspace_must_exist_in_map(tmp_path: Path):
                                      'default_workspace = "ghost"'))
     with pytest.raises(ValueError, match="default_workspace"):
         load_config(p, {"DISCORD_TOKEN": "tok"})
+
+
+def test_token_is_absent_from_the_repr(cfg):
+    assert "tok" not in repr(cfg)
+
+
+def test_workspace_allowlist_cannot_be_mutated(cfg):
+    with pytest.raises(TypeError):
+        cfg.workspaces["evil"] = "/etc"
+
+
+def test_relative_workspace_path_is_refused(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text(CONFIG_TEXT.replace('scratch = "/srv/agy/scratch"',
+                                     'scratch = "relative/path"'))
+    with pytest.raises(ValueError, match="absolute"):
+        load_config(p, {"DISCORD_TOKEN": "tok"})
