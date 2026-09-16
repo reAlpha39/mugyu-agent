@@ -16,6 +16,17 @@ app = "/srv/agy/app"
 """
 
 
+
+def with_tier(tier: str) -> str:
+    """CONFIG_TEXT with default_tier set.
+
+    Inserted before [workspaces] rather than appended: a key written after a
+    table header belongs to that table, so appending would define
+    workspaces.default_tier instead.
+    """
+    return CONFIG_TEXT.replace("[workspaces]",
+                               f'default_tier = "{tier}"\n\n[workspaces]')
+
 @pytest.fixture
 def cfg(tmp_path: Path):
     p = tmp_path / "config.toml"
@@ -111,4 +122,33 @@ def test_relative_workspace_path_is_refused(tmp_path: Path):
     p.write_text(CONFIG_TEXT.replace('scratch = "/srv/agy/scratch"',
                                      'scratch = "relative/path"'))
     with pytest.raises(ValueError, match="absolute"):
+        load_config(p, {"DISCORD_TOKEN": "tok"})
+
+
+def test_default_tier_is_stranger_when_absent(cfg):
+    assert cfg.default_tier == "stranger"
+    assert tier_of(cfg, "999") == "stranger"
+
+
+def test_default_tier_member_opens_the_bot_to_everyone(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text(with_tier("member"))
+    c = load_config(p, {"DISCORD_TOKEN": "tok"})
+    assert tier_of(c, "999") == "member"
+    # Named tiers still win over the default.
+    assert tier_of(c, "1") == "owner"
+    assert tier_of(c, "2") == "member"
+
+
+def test_default_tier_owner_is_refused(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text(with_tier("owner"))
+    with pytest.raises(ValueError, match="default_tier"):
+        load_config(p, {"DISCORD_TOKEN": "tok"})
+
+
+def test_default_tier_nonsense_is_refused(tmp_path: Path):
+    p = tmp_path / "config.toml"
+    p.write_text(with_tier("admin"))
+    with pytest.raises(ValueError, match="default_tier"):
         load_config(p, {"DISCORD_TOKEN": "tok"})

@@ -63,6 +63,13 @@ use it. Members get no DM access at all, only channel threads.
 
 Tier follows the author of each message, not the thread's creator.
 
+By default anyone unlisted is a stranger. Setting `default_tier = "member"`
+in `config.toml` instead opens the bot to everyone who can post in an
+allowlisted channel, in plan mode — the channel membership becomes the
+access control, so anyone who can be added to the channel can drive the
+agent and consume Antigravity quota. `default_tier = "owner"` is refused:
+a typo there would hand everyone unrestricted file and shell access.
+
 `--mode plan` is a model-level guardrail, not a sandbox. Members are treated
 as semi-trusted colleagues. The real containment is the `agy` service
 account, which has no sudo rights and can write only to the workspace tree.

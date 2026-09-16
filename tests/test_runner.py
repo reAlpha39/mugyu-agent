@@ -529,7 +529,8 @@ from agybot.runner import preflight, PreflightError, sweep_stray_agy
 def cfg_with(tmp_path, agy_bin: str, workspaces: dict) -> Config:
     return Config(
         owner_id="1", members=frozenset(), channels=frozenset(),
-        default_workspace=next(iter(workspaces)), workspaces=workspaces,
+        default_workspace=next(iter(workspaces)), default_tier="stranger",
+        workspaces=workspaces,
         agy_bin=agy_bin, token="tok",
     )
 

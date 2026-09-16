@@ -23,6 +23,10 @@ class Config:
     members: frozenset[str]
     channels: frozenset[str]
     default_workspace: str
+    # Tier for anyone named neither as owner nor as a member. "stranger"
+    # refuses them; "member" opens the bot to everyone who can post in an
+    # allowlisted channel. Never "owner" — see load_config.
+    default_tier: str
     workspaces: Mapping[str, str]
     agy_bin: str
     token: str = field(repr=False)
@@ -45,6 +49,14 @@ def load_config(path: Path, env: Mapping[str, str]) -> Config:
         raise ValueError(
             f"workspace paths must be absolute: {', '.join(relative)}")
 
+    default_tier = str(raw.get("default_tier", "stranger"))
+    if default_tier not in ("stranger", "member"):
+        # "owner" is refused deliberately: a typo there would hand everyone
+        # who can reach the bot unrestricted file and shell access.
+        raise ValueError(
+            f"default_tier must be 'stranger' or 'member', not "
+            f"{default_tier!r}")
+
     default_workspace = str(raw["default_workspace"])
     if default_workspace not in workspaces:
         raise ValueError(
@@ -56,6 +68,7 @@ def load_config(path: Path, env: Mapping[str, str]) -> Config:
         members=frozenset(str(m) for m in raw.get("members", [])),
         channels=frozenset(str(c) for c in raw.get("channels", [])),
         default_workspace=default_workspace,
+        default_tier=default_tier,
         workspaces=MappingProxyType(workspaces),
         agy_bin=env.get("AGY_BIN", "agy"),
         token=token,
@@ -68,7 +81,7 @@ def tier_of(cfg: Config, user_id: str) -> str:
         return "owner"
     if user_id in cfg.members:
         return "member"
-    return "stranger"
+    return cfg.default_tier
 
 
 def resolve_workspace(cfg: Config, name: str | None) -> str:

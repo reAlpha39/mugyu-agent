@@ -8,6 +8,13 @@ owner_id = "000000000000000000"
 # Restricted to --mode plan --sandbox.
 members = ["111111111111111111"]
 
+# Tier for anyone listed neither above nor as owner.
+#   "stranger" (default) refuses them with a reaction and spawns nothing.
+#   "member"   opens the bot to everyone who can post in the channels below,
+#              in plan mode. The channel list becomes the access control.
+# "owner" is refused here: a typo would hand everyone file and shell access.
+default_tier = "stranger"
+
 # Mentions are honored only in these channels.
 channels = ["222222222222222222"]
 
