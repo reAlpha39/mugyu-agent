@@ -26,6 +26,18 @@ if mode == "fail":
     sys.stderr.write("fatal: not authenticated with Antigravity\n")
     sys.exit(1)
 
+if mode == "bigline":
+    # One NDJSON line far past asyncio's default 64 KiB readline cap.
+    emit({"event": "init", "conversation_id": CID,
+          "init": {"cwd": os.getcwd(), "tools": []}})
+    step(step_index=0, state="DONE", step_type="agent_response",
+         text_delta="Z" * 200_000)
+    emit({"event": "result",
+          "result": {"conversation_id": CID, "status": "SUCCESS",
+                     "duration_seconds": 0.1, "num_turns": 1,
+                     "usage": {"total_tokens": 1}}})
+    sys.exit(0)
+
 emit({"event": "init", "conversation_id": CID,
       "init": {"cwd": os.getcwd(), "tools": ["view_file"]}})
 step(step_index=0, state="DONE", step_type="user_input")

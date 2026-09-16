@@ -437,3 +437,61 @@ async def test_wall_timeout_kills_a_wedged_turn(tmp_path):
     t, _, ch = turn_for("slow", tmp_path, wall_timeout=0.5)
     assert await asyncio.wait_for(t.run(), 10) != 0
     assert "-# 🛑 cancelled" in "\n".join(ch.messages)
+
+
+class ExplodingSink:
+    """A sink whose feed raises, standing in for a Discord API failure."""
+
+    def __init__(self, fail_on: int = 1) -> None:
+        self.conversation_id = None
+        self._seen = 0
+        self._fail_on = fail_on
+
+    async def start(self) -> None:
+        pass
+
+    async def feed(self, piece) -> None:
+        self._seen += 1
+        if self._seen >= self._fail_on:
+            raise RuntimeError("discord exploded")
+
+    async def finish(self, *a, **k) -> None:
+        pass
+
+
+async def test_a_sink_failure_does_not_leak_the_process(tmp_path):
+    env = {"FAKE_AGY_MODE": "slow", "PATH": os.environ["PATH"]}
+    t = Turn([sys.executable, FAKE], cwd=str(tmp_path), env=env,
+             sink=ExplodingSink())
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(t.run(), 15)
+    assert t._proc is not None
+    assert t._proc.returncode is not None, "the process was left running"
+
+
+async def test_a_sink_failure_does_not_leak_tasks(tmp_path):
+    before = asyncio.all_tasks()
+    env = {"FAKE_AGY_MODE": "slow", "PATH": os.environ["PATH"]}
+    t = Turn([sys.executable, FAKE], cwd=str(tmp_path), env=env,
+             sink=ExplodingSink())
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(t.run(), 15)
+    await asyncio.sleep(0)
+    leaked = asyncio.all_tasks() - before
+    leaked.discard(asyncio.current_task())
+    assert not leaked, [t.get_coro() for t in leaked]
+
+
+async def test_cancel_before_the_process_spawns_still_stops_the_turn(tmp_path):
+    t, _, ch = turn_for("slow", tmp_path)
+    await t.cancel()
+    returncode = await asyncio.wait_for(t.run(), 15)
+    assert t.cancelled
+    assert returncode != 0, "a cancelled turn must not report success"
+    assert "-# 🛑 cancelled" in "\n".join(ch.messages)
+
+
+async def test_a_line_past_the_default_stream_limit_is_read(tmp_path):
+    t, _, ch = turn_for("bigline", tmp_path)
+    assert await asyncio.wait_for(t.run(), 15) == 0
+    assert "Z" * 100 in "".join(ch.messages)

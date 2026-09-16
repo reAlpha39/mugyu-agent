@@ -182,6 +182,9 @@ class Slots:
 WALL_TIMEOUT = 960.0          # 16 minutes, backstop for --print-timeout 15m
 KILL_GRACE = 5.0
 STDERR_KEEP = 4096
+# asyncio's default 64 KiB readline cap is too small for a result event
+# carrying a long answer or a large tool output.
+STREAM_LIMIT = 4 * 1024 * 1024
 
 
 class Turn:
@@ -208,7 +211,14 @@ class Turn:
             cwd=self._cwd,
             env=self._env,
             start_new_session=True,
+            limit=STREAM_LIMIT,
         )
+
+        # A cancel() that arrived while the sink was starting had no process
+        # to signal. Honour it now rather than running the turn to completion
+        # and reporting it to the user as cancelled.
+        if self.cancelled:
+            await self._kill()
 
         stderr_task = asyncio.create_task(self._proc.stderr.read())
         watchdog = asyncio.create_task(self._watchdog())
@@ -225,12 +235,23 @@ class Turn:
                     await self._sink.feed(piece)
 
             returncode = await self._proc.wait()
+            stderr = (await stderr_task).decode("utf-8", "replace")
+        except BaseException:
+            # Anything escaping this loop — a Discord failure raised by the
+            # sink, a stream overrun, cancellation of this coroutine — must
+            # not leave the process group running. start_new_session means
+            # nothing else will ever reap it.
+            await self._kill()
+            raise
         finally:
             watchdog.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await watchdog
+            if not stderr_task.done():
+                stderr_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await stderr_task
 
-        stderr = (await stderr_task).decode("utf-8", "replace")
         await self._sink.finish(returncode, stderr[-STDERR_KEEP:],
                                 cancelled=self.cancelled)
         return returncode
