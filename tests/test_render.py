@@ -1,4 +1,6 @@
-from agybot.render import Chunker, fence_state, LIMIT
+import pytest
+
+from agybot.render import Chunker, fence_state, LIMIT, Sink, Text, Tool, Meta, fmt_elapsed
 
 
 def test_limit_is_1800():
@@ -177,3 +179,128 @@ def test_overlong_fence_language_is_dropped_on_reopen():
     assert sealed, "this feed should have forced a seal"
     assert c.current.startswith("```\n")
     assert all(len(b) <= LIMIT for b in sealed)
+
+
+class FakeChannel:
+    """Records every send and edit so tests can assert on final state."""
+
+    def __init__(self):
+        self.messages: list[str] = []
+
+    async def send(self, content: str) -> int:
+        self.messages.append(content)
+        return len(self.messages) - 1
+
+    async def edit(self, handle: int, content: str) -> None:
+        self.messages[handle] = content
+
+
+@pytest.fixture
+def ch():
+    return FakeChannel()
+
+
+def sink_for(ch) -> Sink:
+    # A short interval keeps tests fast without spinning the writer hot.
+    # interval=0 would busy-loop asyncio.sleep(0) for the whole turn.
+    return Sink(ch.send, ch.edit, interval=0.01)
+
+
+def test_fmt_elapsed_under_a_minute():
+    assert fmt_elapsed(9.4) == "9s"
+
+
+def test_fmt_elapsed_over_a_minute():
+    assert fmt_elapsed(82) == "1m22s"
+
+
+async def test_start_posts_a_placeholder(ch):
+    s = sink_for(ch)
+    await s.start()
+    assert ch.messages == ["🤔 …"]
+
+
+async def test_text_replaces_the_placeholder(ch):
+    s = sink_for(ch)
+    await s.start()
+    await s.feed(Text("hello world"))
+    await s.finish(0)
+    assert ch.messages[0].startswith("hello world")
+
+
+async def test_tool_renders_as_subtext(ch):
+    s = sink_for(ch)
+    await s.start()
+    await s.feed(Tool("read", "auth.py", ok=None))
+    await s.finish(0)
+    assert "-# 🔧 read · auth.py" in ch.messages[0]
+
+
+async def test_failed_tool_renders_a_warning(ch):
+    s = sink_for(ch)
+    await s.start()
+    await s.feed(Tool("bash", "exit 1", ok=False))
+    await s.finish(0)
+    assert "-# ⚠️ bash · exit 1" in ch.messages[0]
+
+
+async def test_meta_is_captured_and_not_displayed(ch):
+    s = sink_for(ch)
+    await s.start()
+    await s.feed(Meta("c-abc"))
+    await s.feed(Text("body"))
+    await s.finish(0)
+    assert s.conversation_id == "c-abc"
+    assert "c-abc" in ch.messages[0]      # only via the footer
+    assert ch.messages[0].index("body") < ch.messages[0].index("c-abc")
+
+
+async def test_overflow_creates_a_second_message(ch):
+    s = sink_for(ch)
+    await s.start()
+    await s.feed(Text("a" * (LIMIT - 5)))
+    await s.feed(Text("bbbbbbbbbb"))
+    await s.finish(0)
+    assert len(ch.messages) == 2
+    assert all(len(m) <= 2000 for m in ch.messages)
+
+
+async def test_success_footer_on_the_last_message(ch):
+    s = sink_for(ch)
+    await s.start()
+    await s.feed(Text("done"))
+    await s.finish(0)
+    assert "-# ✅" in ch.messages[-1]
+
+
+async def test_failure_footer_includes_stderr(ch):
+    s = sink_for(ch)
+    await s.start()
+    await s.feed(Text("partial"))
+    await s.finish(1, stderr_tail="boom: could not open project")
+    assert "-# ❌ exit 1" in ch.messages[-1]
+    assert "boom: could not open project" in ch.messages[-1]
+
+
+async def test_cancelled_footer(ch):
+    s = sink_for(ch)
+    await s.start()
+    await s.feed(Text("partial"))
+    await s.finish(-15, cancelled=True)
+    assert "-# 🛑 cancelled" in ch.messages[-1]
+
+
+async def test_tool_count_appears_in_the_footer(ch):
+    s = sink_for(ch)
+    await s.start()
+    await s.feed(Tool("read", "a.py", ok=True))
+    await s.feed(Tool("read", "b.py", ok=True))
+    await s.finish(0)
+    assert "2 tools" in ch.messages[-1]
+
+
+async def test_finish_without_any_output_still_reports(ch):
+    s = sink_for(ch)
+    await s.start()
+    await s.finish(1, stderr_tail="not authenticated")
+    assert "not authenticated" in ch.messages[-1]

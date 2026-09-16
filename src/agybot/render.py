@@ -1,7 +1,10 @@
 """Piece vocabulary and the Discord message chunker."""
 from __future__ import annotations
 
+import asyncio
+import time
 from dataclasses import dataclass
+from typing import Any, Awaitable, Callable
 
 LIMIT = 1800
 
@@ -143,3 +146,104 @@ class Chunker:
     @staticmethod
     def _close_fence(body: str) -> str:
         return body + _close_suffix(body)
+
+
+SendFn = Callable[[str], Awaitable[Any]]
+EditFn = Callable[[Any, str], Awaitable[None]]
+
+PLACEHOLDER = "🤔 …"
+STDERR_TAIL = 300
+
+
+def fmt_elapsed(seconds: float) -> str:
+    total = int(seconds)
+    if total < 60:
+        return f"{total}s"
+    return f"{total // 60}m{total % 60:02d}s"
+
+
+class Sink:
+    """Streams pieces into a Discord thread as live-edited messages.
+
+    Only the most recent message is ever edited; sealed messages are final.
+    Edit cost is therefore flat in the length of the turn.
+    """
+
+    def __init__(self, send: SendFn, edit: EditFn,
+                 limit: int = LIMIT, interval: float = 1.5) -> None:
+        self._send = send
+        self._edit = edit
+        self._interval = interval
+        self._chunker = Chunker(limit)
+        self._handle: Any = None
+        self._dirty = False
+        self._writer: asyncio.Task | None = None
+        self._started = 0.0
+        self._tools = 0
+        self.conversation_id: str | None = None
+
+    async def start(self) -> None:
+        self._started = time.monotonic()
+        self._handle = await self._send(PLACEHOLDER)
+        self._writer = asyncio.create_task(self._pump())
+
+    async def feed(self, piece: Piece) -> None:
+        if isinstance(piece, Meta):
+            self.conversation_id = piece.conversation_id
+            return
+
+        if isinstance(piece, Tool):
+            self._tools += 1
+            icon = "⚠️" if piece.ok is False else "🔧"
+            text = f"\n-# {icon} {piece.name} · {piece.detail}\n"
+        else:
+            text = piece.s
+
+        for sealed in self._chunker.feed(text):
+            await self._edit(self._handle, sealed)
+            self._handle = await self._send(self._chunker.current or "…")
+        self._dirty = True
+
+    async def finish(self, returncode: int, stderr_tail: str = "",
+                     cancelled: bool = False) -> None:
+        if self._writer is not None:
+            self._writer.cancel()
+            self._writer = None
+
+        footer = self._footer(returncode, stderr_tail, cancelled)
+        bodies = self._chunker.flush()
+        body = bodies[0] if bodies else ""
+
+        # flush() yields at most one body, so the footer joins it whenever
+        # the pair fits inside Discord's hard 2000-character message cap.
+        if len(body) + len(footer) <= 2000:
+            await self._edit(self._handle, (body + footer) or PLACEHOLDER)
+        else:
+            await self._edit(self._handle, body)
+            self._handle = await self._send(footer)
+
+    def _footer(self, returncode: int, stderr_tail: str,
+                cancelled: bool) -> str:
+        elapsed = fmt_elapsed(time.monotonic() - self._started)
+        cid = self.conversation_id or "unknown"
+        if cancelled:
+            head = "-# 🛑 cancelled"
+        elif returncode == 0:
+            head = "-# ✅"
+        else:
+            head = f"-# ❌ exit {returncode}"
+        out = f"\n{head} · {elapsed} · {self._tools} tools · conv {cid}"
+        if returncode != 0 and stderr_tail:
+            out += f"\n```\n{stderr_tail[-STDERR_TAIL:]}\n```"
+        return out
+
+    async def _pump(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self._interval)
+                if self._dirty:
+                    self._dirty = False
+                    await self._edit(self._handle,
+                                     self._chunker.current or PLACEHOLDER)
+        except asyncio.CancelledError:
+            pass
