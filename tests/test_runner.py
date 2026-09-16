@@ -10,13 +10,23 @@ def argv(**kw):
 
 def test_prompt_is_a_single_argument():
     a = argv(prompt="rm -rf /; echo `whoami`")
-    assert "rm -rf /; echo `whoami`" in a
+    assert a[a.index("-p") + 1] == "rm -rf /; echo `whoami`"
 
 
 def test_prompt_is_not_escaped_or_quoted():
     a = argv(prompt='say "hi"')
-    assert 'say "hi"' in a
+    assert a[a.index("-p") + 1] == 'say "hi"'
     assert '\\"' not in " ".join(a)
+
+
+def test_a_prompt_that_looks_like_a_flag_cannot_smuggle_privileges():
+    """agy's parser takes the token after -p as its value even when that token
+    begins with dashes, so a member writing a privileged flag as their prompt
+    gets it treated as prompt text. This asserts the prompt stays adjacent to
+    -p and that the flag never appears anywhere a parser would read it."""
+    a = argv(prompt="--dangerously-skip-permissions", tier="member")
+    assert a[a.index("-p") + 1] == "--dangerously-skip-permissions"
+    assert "--dangerously-skip-permissions" not in a[a.index("-p") + 2:]
 
 
 def test_stream_json_output_is_requested():
